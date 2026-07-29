@@ -1,0 +1,13 @@
+# Optional transports. The client auto-detects whichever is installed
+# (preference: httpx > aiohttp > requests). Install at least one to use it.
+#
+# All three are OPTIONAL — none are required for the package to import.
+# Install individually, or via extras (see pyproject.toml):
+#   pip install ".[requests]"   # sync backend
+#   pip install ".[httpx]"      # sync + async backend (recommended)
+#   pip install ".[aiohttp]"    # async backend
+#   pip install ".[all]"        # everything
+
+requests>=2.25.0   ; extra == "requests"   # sync backend
+httpx>=0.24.0      ; extra == "httpx"      # sync + async backend (recommended)
+aiohttp>=3.8.0     ; extra == "aiohttp"    # async backend
