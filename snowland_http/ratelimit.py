@@ -50,7 +50,14 @@ class RateLimiter:
             self._last = now
 
     def acquire(self) -> None:
-        """Blocking acquire: waits (sleeps) until a token is available."""
+        """Blocking acquire: waits (sleeps) until a token is available.
+
+        The sleep happens *inside* the lock so that ``_last`` (and therefore the
+        token refill baseline) is advanced serially and stays visible to every
+        other waiting thread. Letting the sleep happen outside the lock would let
+        concurrent threads each push ``_last`` forward independently, which
+        under-counts the total wait time of a parallel burst.
+        """
         with self._lock:
             self._refill()
             if self._tokens >= 1.0:
@@ -61,10 +68,15 @@ class RateLimiter:
             # Advance the reference time to when the token actually arrives,
             # otherwise the sleeping time would be counted as refill too.
             self._last += wait
-        time.sleep(wait)
+            time.sleep(wait)
 
     async def acquire_async(self) -> None:
-        """Async acquire: awaits (via asyncio.sleep) until a token is available."""
+        """Async acquire: awaits (via asyncio.sleep) until a token is available.
+
+        The sleep happens *inside* the lock (asyncio keeps the lock held across
+        the await) so that ``_last`` advances serially and stays visible to every
+        other coroutine, preserving the global rate for concurrent requests.
+        """
         if self._async_lock is None:
             self._async_lock = asyncio.Lock()
         async with self._async_lock:
@@ -75,4 +87,4 @@ class RateLimiter:
             wait = (1.0 - self._tokens) / self.rate
             self._tokens = 0.0
             self._last += wait
-        await asyncio.sleep(wait)
+            await asyncio.sleep(wait)
