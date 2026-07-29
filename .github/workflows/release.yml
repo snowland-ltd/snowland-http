@@ -8,13 +8,6 @@ jobs:
   build-and-publish:
     name: Build and publish to PyPI
     runs-on: ubuntu-latest
-    # For PyPI Trusted Publishing (OIDC, no token needed), enable the
-    # "pypi" environment and leave permissions as below. Alternatively,
-    # remove the `permissions` block and uncomment the `password` in the
-    # publish step to use a PYPI_API_TOKEN repository secret instead.
-    environment: pypi
-    permissions:
-      id-token: write
 
     steps:
       - name: Checkout
@@ -32,5 +25,5 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # with:
-        #   password: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
