@@ -33,16 +33,17 @@ class RateLimiter:
     """A thread-safe / asyncio-safe token bucket rate limiter."""
 
     def __init__(self, config: RateLimitConfig):
-        if config.max_rate <= 0:
-            raise ValueError("RateLimiter requires max_rate > 0")
-        self.rate = float(config.max_rate)
-        self.capacity = float(max(int(config.burst), 1))
+        self.enabled = config.max_rate > 0
+        self.rate = float(config.max_rate) if self.enabled else 0.0
+        self.capacity = float(max(int(config.burst), 1)) if self.enabled else 0.0
         self._tokens = self.capacity
         self._last = time.monotonic()
         self._lock = threading.Lock()
         self._async_lock = None  # created lazily inside a running loop
 
     def _refill(self) -> None:
+        if not self.enabled:
+            return
         now = time.monotonic()
         elapsed = now - self._last
         if elapsed > 0:
@@ -50,14 +51,21 @@ class RateLimiter:
             self._last = now
 
     def acquire(self) -> None:
-        """Blocking acquire: waits (sleeps) until a token is available.
+        """Blocking acquire.
 
-        The sleep happens *inside* the lock so that ``_last`` (and therefore the
-        token refill baseline) is advanced serially and stays visible to every
-        other waiting thread. Letting the sleep happen outside the lock would let
-        concurrent threads each push ``_last`` forward independently, which
-        under-counts the total wait time of a parallel burst.
+        When rate limiting is disabled (``max_rate <= 0``) this returns
+        immediately without touching the token bucket or taking the lock, so
+        callers never block and the rate is effectively infinite.
+
+        Otherwise it waits (sleeps) until a token is available. The sleep happens
+        *inside* the lock so that ``_last`` (and therefore the token refill
+        baseline) is advanced serially and stays visible to every other waiting
+        thread. Letting the sleep happen outside the lock would let concurrent
+        threads each push ``_last`` forward independently, which under-counts the
+        total wait time of a parallel burst.
         """
+        if not self.enabled:
+            return
         with self._lock:
             self._refill()
             if self._tokens >= 1.0:
@@ -71,12 +79,18 @@ class RateLimiter:
             time.sleep(wait)
 
     async def acquire_async(self) -> None:
-        """Async acquire: awaits (via asyncio.sleep) until a token is available.
+        """Async acquire.
+
+        When rate limiting is disabled (``max_rate <= 0``) this returns
+        immediately. Otherwise it awaits (via asyncio.sleep) until a token is
+        available.
 
         The sleep happens *inside* the lock (asyncio keeps the lock held across
         the await) so that ``_last`` advances serially and stays visible to every
         other coroutine, preserving the global rate for concurrent requests.
         """
+        if not self.enabled:
+            return
         if self._async_lock is None:
             self._async_lock = asyncio.Lock()
         async with self._async_lock:

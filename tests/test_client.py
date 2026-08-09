@@ -10,6 +10,7 @@ server are skipped automatically when no HTTP backend is installed.
 
 import importlib.util
 import json
+import os
 import threading
 import time
 import unittest
@@ -41,6 +42,29 @@ class RateLimiterTest(unittest.TestCase):
         self.assertGreater(elapsed, 0.15)
         self.assertLess(elapsed, 0.8)
 
+    def test_disabled_does_not_raise_and_is_nonblocking(self):
+        # max_rate <= 0 means "no limit": must construct without error and
+        # acquire() must return immediately (never block, never divide by zero).
+        limiter = RateLimiter(RateLimitConfig(max_rate=0))
+        self.assertFalse(limiter.enabled)
+        start = time.monotonic()
+        for _ in range(100):
+            limiter.acquire()
+        self.assertLess(time.monotonic() - start, 0.1)
+
+    def test_disabled_async_is_nonblocking(self):
+        import asyncio
+
+        async def run():
+            limiter = RateLimiter(RateLimitConfig(max_rate=0))
+            start = time.monotonic()
+            for _ in range(100):
+                await limiter.acquire_async()
+            return time.monotonic() - start
+
+        elapsed = asyncio.run(run())
+        self.assertLess(elapsed, 0.1)
+
 
 class BackendSelectionTest(unittest.TestCase):
     def test_unknown_backend_raises(self):
@@ -56,8 +80,16 @@ class BackendSelectionTest(unittest.TestCase):
             self.skipTest("no HTTP backend installed")
 
 
-@unittest.skipUnless(_has("requests"), "requests not installed")
 class FunctionalTest(unittest.TestCase):
+    """Runs against a local server.
+
+    Uses the dependency-free standard-library backend (``stdlib``) by default so
+    the full functional suite works even when no third-party HTTP library is
+    installed. Set ``SNOWLAND_HTTP_TEST_BACKEND`` to force a specific backend.
+    """
+
+    BACKEND = os.environ.get("SNOWLAND_HTTP_TEST_BACKEND", "stdlib")
+
     @classmethod
     def setUpClass(cls):
         class Handler(BaseHTTPRequestHandler):
@@ -85,13 +117,13 @@ class FunctionalTest(unittest.TestCase):
         return f"http://127.0.0.1:{self.port}{path}"
 
     def test_single_request(self):
-        client = HttpClient(backend="requests")
+        client = HttpClient(backend=self.BACKEND)
         resp = client.get(self._url("/hello"))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()["path"], "/hello")
 
     def test_parallel_requests(self):
-        client = HttpClient(backend="requests", max_workers=5)
+        client = HttpClient(backend=self.BACKEND, max_workers=5)
         urls = [self._url(f"/item/{i}") for i in range(10)]
         results = client.get_many(urls, return_exceptions=False)
         self.assertEqual(len(results), 10)
@@ -101,7 +133,7 @@ class FunctionalTest(unittest.TestCase):
     def test_rate_limited_parallel(self):
         # 10 requests at max_rate=20 -> should finish in ~0.5s, well under 5s.
         client = HttpClient(
-            backend="requests",
+            backend=self.BACKEND,
             rate_limit=RateLimitConfig(max_rate=20, burst=1),
             max_workers=10,
         )
@@ -114,7 +146,7 @@ class FunctionalTest(unittest.TestCase):
         self.assertLess(elapsed, 3.0)
 
     def test_return_exceptions_captures_errors(self):
-        client = HttpClient(backend="requests")
+        client = HttpClient(backend=self.BACKEND)
         # One good URL, one to a closed port -> connection error.
         results = client.request_many(
             [
