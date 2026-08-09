@@ -36,4 +36,4 @@ Initial release of `snowland-http`.
 
 BSD 3-Clause.
 
-[0.1.0]: https://github.com/snowland-ai/snowland-http/releases/tag/v0.1.0
+[0.1.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.1.0

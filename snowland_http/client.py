@@ -3,7 +3,9 @@
 Features
 --------
 * Pluggable transport: ``requests`` (sync), ``httpx`` (sync + async),
-  ``aiohttp`` (async). Select via ``backend=`` or let it auto-detect.
+  ``aiohttp`` (async), and ``stdlib`` (sync, built on :mod:`urllib` with NO
+  third-party dependencies). Select via ``backend=`` or let it auto-detect
+  among requests/httpx/aiohttp.
 * Global token-bucket rate limiting applied across *all* parallel workers,
   so the aggregate request rate stays under the configured ceiling.
 * Parallel requests via a thread pool (sync) or ``asyncio.gather`` +
@@ -32,6 +34,22 @@ Async usage
             results = await client.get_many_async(["https://a.com", "https://b.com"])
 
     asyncio.run(main())
+
+Zero-dependency usage
+---------------------
+When no third-party HTTP library is installed, the standard-library backend
+works out of the box (sync only)::
+
+    from snowland_http import HttpClient
+
+    client = HttpClient(backend="stdlib")
+    resp = client.get("https://example.com")
+    print(resp.status_code, resp.text)
+
+The ``stdlib`` backend is synchronous-only and supports ``method``, ``url``,
+``headers``, ``params``, ``data`` (bytes/str/dict), ``json`` and ``timeout``.
+When no third-party transport is installed, ``backend="auto"`` falls back to it
+automatically; you can also pass ``backend="stdlib"`` explicitly.
 """
 
 import asyncio

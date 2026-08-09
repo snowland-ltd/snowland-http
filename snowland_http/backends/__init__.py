@@ -16,9 +16,10 @@ def detect_backend() -> str:
             return name
         except ImportError:
             continue
-    raise BackendNotSupportedError(
-        "No HTTP backend available. Install one of: httpx, aiohttp, requests"
-    )
+    # No third-party transport is installed: fall back to the dependency-free
+    # standard-library backend (urllib) so HttpClient(backend="auto") still works
+    # in a bare-Python environment. Note it is synchronous-only.
+    return "stdlib"
 
 
 def build_backend(name: str) -> BaseBackend:
@@ -34,6 +35,10 @@ def build_backend(name: str) -> BaseBackend:
         from snowland_http.backends.aiohttp_backend import AiohttpBackend
 
         return AiohttpBackend()
+    if name in ("stdlib", "urllib"):
+        from snowland_http.backends.stdlib_backend import StdlibBackend
+
+        return StdlibBackend()
     raise BackendNotSupportedError(f"Unknown backend: {name}")
 
 
