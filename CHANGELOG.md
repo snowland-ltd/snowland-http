@@ -22,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Can be executed directly with `HttpClient` or in batches with `Orchestrator`
   - Provides `execute_tasks_parallel()` and `execute_tasks_async()` methods in `Orchestrator`
 - **Example code**: `examples/orchestrator_example.py` demonstrating Orchestrator and Task usage.
+- **API documentation for v0.3** (`doc/API_0.3.md`).
 
 ## [0.2.0] - 2026-08-09
 

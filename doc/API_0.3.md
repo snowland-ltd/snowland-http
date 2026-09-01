@@ -1,0 +1,530 @@
+# snowland-http API 文档（v0.3）
+
+> 版本：0.3.0
+> 许可证：BSD 3-Clause
+> 一个支持**限流**与**并行**的 HTTP 客户端，底层可自由切换 `requests` / `httpx` / `aiohttp`，或零依赖的 `stdlib`（标准库 `urllib`）。v0.3 新增**编排器（Orchestrator）**与**任务（Task）**，支持多连接的多进程 / 多线程 / 协程并行，以及请求的预处理与后处理。
+
+---
+
+## 1. 模块与公开导出
+
+包名：`snowland_http`
+
+```python
+from snowland_http import (
+    HttpClient,         # 主客户端
+    HttpResponse,       # 统一响应对象
+    RateLimitConfig,    # 限流配置
+    RateLimiter,        # 限流器（令牌桶）
+    HttpClientError,    # 异常基类
+    BackendNotSupportedError,
+    AsyncRequiredError,
+    Orchestrator,       # v0.3 新增：多连接编排器
+    Task,               # v0.3 新增：带预处理/后处理的任务
+    execute_parallel_requests,   # v0.3 新增：独立并行执行函数
+    execute_async_requests,      # v0.3 新增：独立异步执行函数
+)
+```
+
+后端相关类（按需使用）：
+
+```python
+from snowland_http.backends import (
+    BaseBackend,        # 后端抽象基类
+    RequestsBackend,    # requests 实现（仅同步）
+    HttpxBackend,       # httpx 实现（同步 + 异步）
+    AiohttpBackend,     # aiohttp 实现（仅异步）
+    StdlibBackend,      # 标准库 urllib 实现（仅同步，零依赖）
+)
+```
+
+---
+
+## 2. `HttpClient`
+
+高层的 HTTP 客户端。所有请求共享同一个限流器，因此并行时聚合速率受 `RateLimitConfig` 约束。
+
+### 构造
+
+```python
+HttpClient(
+    backend: str = "auto",
+    rate_limit: Optional[RateLimitConfig] = None,
+    max_workers: int = 10,
+    max_concurrency: int = 10,
+)
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `backend` | 传输后端：`"requests"` / `"httpx"` / `"aiohttp"` / `"stdlib"`（或别名 `"urllib"`） / `"auto"`（自动探测，优先级 httpx > aiohttp > requests > **stdlib**）。未知值抛 `BackendNotSupportedError`。 |
+| `rate_limit` | `RateLimitConfig` 实例；`max_rate <= 0` 表示不限流（限流器变为空操作，不抛异常）。 |
+| `max_workers` | 同步并行（`request_many` / `get_many`）使用的线程池大小。 |
+| `max_concurrency` | 异步并行（`request_many_async` / `get_many_async`）使用的信号量并发上限。 |
+
+### 同步 API
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `request` | `request(method: str, url: str, **kwargs) -> HttpResponse` | 单次同步请求。`kwargs` 透传给底层库（如 `params`、`headers`、`json`、`data`、`timeout`）。 |
+| `get` | `get(url, **kwargs) -> HttpResponse` | `request("GET", ...)` |
+| `post` | `post(url, **kwargs) -> HttpResponse` | `request("POST", ...)` |
+| `put` | `put(url, **kwargs) -> HttpResponse` | `request("PUT", ...)` |
+| `delete` | `delete(url, **kwargs) -> HttpResponse` | `request("DELETE", ...)` |
+| `head` | `head(url, **kwargs) -> HttpResponse` | `request("HEAD", ...)` |
+| `patch` | `patch(url, **kwargs) -> HttpResponse` | `request("PATCH", ...)` |
+| `request_many` | `request_many(items, max_workers=None, return_exceptions=True) -> List[Any]` | 线程池并行请求。 |
+| `get_many` | `get_many(urls, method="GET", max_workers=None, return_exceptions=True, **kwargs) -> List[Any]` | 对一批 URL 并行请求。 |
+| `open` | `open() -> None` | 打开/建立连接资源（进入同步上下文时自动调用）。 |
+
+### 异步 API
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `request_async` | `request_async(method: str, url: str, **kwargs) -> HttpResponse` | 单次异步请求。 |
+| `get_async` … `patch_async` | `get_async(url, **kwargs) -> HttpResponse` 等 | 异步便捷方法，对应同步版本。 |
+| `request_many_async` | `request_many_async(items, max_concurrency=None, return_exceptions=True) -> List[Any]` | `asyncio.gather` + `Semaphore` 并行请求。 |
+| `get_many_async` | `get_many_async(urls, method="GET", max_concurrency=None, return_exceptions=True, **kwargs) -> List[Any]` | 对一批 URL 异步并行请求。 |
+| `open_async` | `open_async() -> None` | 打开/建立异步连接资源（进入异步上下文时自动调用）。 |
+
+### 并行 `items` 的元素格式
+
+`request_many` / `request_many_async` 的 `items` 中每个元素支持两种形式：
+
+- **dict**：`{"method": "GET", "url": "https://...", **kwargs}`
+- **tuple/list**：`(method, url)` 或 `(method, url, kwargs_dict)`
+
+示例：
+
+```python
+client.request_many([
+    {"method": "GET", "url": "https://a.com"},
+    ("POST", "https://b.com", {"json": {"x": 1}}),
+])
+```
+
+### 并行异常处理
+
+- `return_exceptions=True`（默认）：单个请求失败不会中断其余请求，失败项在结果列表中以**异常对象**形式返回。
+- `return_exceptions=False`：任一请求失败即整体抛出。
+
+### 连接开关 / 上下文管理
+
+除了退出时关闭，客户端还支持显式"打开"（建立连接资源）。进入上下文管理器时会先调用 `open` / `open_async`，退出时调用 `close` / `close_async`，从而形成完整的连接生命周期管理。
+
+```python
+client.open()                       # 打开同步后端资源（建立连接）
+client.close()                      # 关闭同步后端资源
+
+await client.open_async()           # 打开异步后端资源
+await client.close_async()          # 关闭异步后端资源
+
+# 上下文管理器：进入即 open，退出即 close
+with HttpClient(...) as c:
+    ...
+
+# 异步上下文管理器：进入即 open_async，退出即 close_async
+async with HttpClient(...) as c:
+    ...
+```
+
+> 对 `aiohttp` 后端，`open_async()` 会在当前运行的事件循环内创建 `ClientSession`，避免"session 未在循环内创建"的问题；`requests` / `httpx` 后端的 `open()` 为幂等空操作（session/client 已在构造时建立）。`stdlib` 后端无持久连接资源，`open()` / `close()` 为空操作。
+
+### 后端约束
+
+- `requests` 仅支持同步 API；调用 `request_async` 等会抛 `AsyncRequiredError`。
+- `aiohttp` 仅支持异步 API；调用 `request` 等会抛 `AsyncRequiredError`。
+- `httpx` 同时支持同步与异步。
+- `stdlib`（urllib）仅支持同步 API；调用 `request_async` 会抛 `AsyncRequiredError`。
+
+---
+
+## 3. `RateLimitConfig`
+
+令牌桶限流配置（dataclass）。
+
+```python
+@dataclass
+class RateLimitConfig:
+    max_rate: float = 0.0   # 每秒允许的最大请求数；<= 0 表示不限流（限流器变为空操作）
+    burst: int = 1          # 允许连续突发的请求数（突发上限）
+
+    def enabled(self) -> bool:
+        """max_rate > 0 时返回 True。"""
+```
+
+> **v0.2 变更**：`max_rate <= 0` 现在表示**完全禁用限流**（限流器不阻塞、不抛异常）。在 0.1 中该取值会抛 `ValueError`，现已修正为安全的"无限制"语义。
+
+---
+
+## 4. `RateLimiter`
+
+令牌桶限流器，同步与异步共用同一令牌计数。
+
+```python
+class RateLimiter:
+    def __init__(self, config: RateLimitConfig): ...
+    def acquire(self) -> None: ...            # 阻塞获取：不足时 time.sleep 等待；禁用时立即返回
+    async def acquire_async(self) -> None: ... # 异步获取：不足时 asyncio.sleep 等待；禁用时立即返回
+```
+
+> 内部实现保证"等待时间不会被重复计入补充"，因此连续受限请求会按 `1 / max_rate` 的间隔平滑节流。`enabled == False` 时 `acquire` / `acquire_async` 均为立即返回的空操作。
+
+---
+
+## 5. `HttpResponse`
+
+跨后端统一的响应封装，屏蔽 `requests` / `httpx` / `aiohttp` / `urllib` 的差异。
+
+```python
+class HttpResponse:
+    def __init__(self, status_code: int, headers: Dict[str, str], content: bytes, url: str, encoding: Optional[str] = None): ...
+
+    @property
+    def text(self) -> str: ...        # 按 Content-Type charset（缺省 ISO-8859-1）解码的响应体
+    @property
+    def ok(self) -> bool: ...         # 200 <= status_code < 300
+    def json(self) -> Any: ...        # 解析 JSON
+    def raise_for_status(self) -> "HttpResponse": ...  # 非 2xx 抛 RuntimeError
+
+    # 工厂方法（由后端在内部调用，一般不直接使用）
+    @classmethod
+    def from_requests(cls, resp) -> "HttpResponse": ...
+    @classmethod
+    def from_httpx(cls, resp) -> "HttpResponse": ...
+    @classmethod
+    def from_aiohttp(cls, resp, content: bytes) -> "HttpResponse": ...
+    @classmethod
+    def from_urllib(cls, resp, content: bytes) -> "HttpResponse": ...
+```
+
+字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `status_code` | `int` | HTTP 状态码 |
+| `headers` | `Dict[str, str]` | 响应头 |
+| `content` | `bytes` | 原始响应体（bytes） |
+| `url` | `str` | 最终请求 URL |
+| `encoding` | `str` | 文本解码所用编码（由显式参数 / `Content-Type` charset / 缺省 `iso-8859-1` 决定） |
+
+> **v0.2 变更（编码）**：`text` 不再硬编码 UTF-8 容错解码，而是严格遵循 HTTP 编码规则——优先使用 `Content-Type` 的 `charset`，缺失时回落到 **ISO-8859-1**（RFC 7231 默认值）。解码不使用 `errors="replace"`，因此非法字节会抛出 `UnicodeDecodeError`，而非静默产生乱码。
+
+---
+
+## 6. 异常
+
+| 异常 | 基类中 | 触发场景 |
+| --- | --- | --- |
+| `HttpClientError` | — | 所有本库异常的基类 |
+| `BackendNotSupportedError` | `HttpClientError` | `backend` 未知，或 `auto` 时无任何传输库可用 |
+| `AsyncRequiredError` | `HttpClientError` | 在仅同步/仅异步后端上误用了对端 API |
+
+---
+
+## 7. 后端（`snowland_http.backends`）
+
+### `BaseBackend`
+
+```python
+class BaseBackend:
+    scheme: str = "sync"   # "sync" | "async" | "both"
+
+    def request(self, method, url, **kwargs) -> HttpResponse: ...
+    async def request_async(self, method, url, **kwargs) -> HttpResponse: ...
+    def close(self) -> None: ...
+    async def close_async(self) -> None: ...
+```
+
+### `RequestsBackend`（仅同步）
+
+```python
+RequestsBackend(session: Optional[requests.Session] = None)
+```
+
+### `HttpxBackend`（同步 + 异步）
+
+```python
+HttpxBackend(
+    client: Optional[httpx.Client] = None,
+    async_client: Optional[httpx.AsyncClient] = None,
+)
+```
+
+### `AiohttpBackend`（仅异步）
+
+```python
+AiohttpBackend(session: Optional[aiohttp.ClientSession] = None)
+```
+
+### `StdlibBackend`（仅同步，零依赖）
+
+```python
+StdlibBackend()
+```
+
+基于标准库 `urllib.request` 实现，无需安装任何第三方库。`scheme = "sync"`，支持 `method` / `url` / `headers` / `params` / `data`（bytes、str 或 dict 表单）/ `json` / `timeout` 等参数。在 `backend="auto"` 且未安装任何第三方传输库时自动被选用。
+
+> 后端为惰性加载：未安装对应库时，包仍可正常 import，仅该后端不可用；`stdlib` 后端始终可用。
+
+---
+
+## 8. `Orchestrator`（编排器） *v0.3 新增*
+
+多连接编排器。管理一个 `HttpClient` 实例池（多个连接），在多个连接上分发请求，支持多进程、多线程、协程三种执行方式，从而提升吞吐量。
+
+### 构造
+
+```python
+Orchestrator(
+    num_connections: int = 4,
+    backend: str = "auto",
+    rate_limit: Optional[RateLimitConfig] = None,
+    max_workers: int = 10,
+    max_concurrency: int = 10,
+)
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `num_connections` | 连接数（即池中 `HttpClient` 实例数量）。必须为正数，否则抛 `ValueError`。 |
+| `backend` | 所有连接共用的传输后端，取值同 `HttpClient`。 |
+| `rate_limit` | 所有连接共用的限流配置。 |
+| `max_workers` | 同步执行（thread 模式）的线程池大小。 |
+| `max_concurrency` | 异步执行（async 模式）的并发上限。 |
+
+### 连接管理
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `get_connection` | `get_connection(index: int) -> HttpClient` | 按索引获取某个连接。索引越界抛 `IndexError`。 |
+| `open_all` | `open_all() -> None` | 打开池中全部连接。 |
+| `open_all_async` | `await open_all_async() -> None` | 异步打开池中全部连接。 |
+| `close_all` | `close_all() -> None` | 关闭池中全部连接。 |
+| `close_all_async` | `await close_all_async() -> None` | 异步关闭池中全部连接。 |
+
+### 上下文管理
+
+编排器同时支持同步与异步上下文管理器：进入时打开全部连接，退出时关闭全部连接。
+
+```python
+# 同步上下文管理器
+with Orchestrator(num_connections=4, backend="httpx") as orch:
+    results = orch.get_many_parallel(urls)
+
+# 异步上下文管理器
+async with Orchestrator(num_connections=4, backend="httpx") as orch:
+    results = await orch.get_many_async(urls)
+```
+
+### 直接请求（`items` / URL 形式）
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `execute_parallel` | `execute_parallel(items, mode="process", max_workers=None, return_exceptions=True) -> List[Any]` | 同步并行执行。`mode` 取 `"process"`（多进程）或 `"thread"`（多线程）。 |
+| `execute_async` | `await execute_async(items, mode="coroutine", max_concurrency=None, return_exceptions=True) -> List[Any]` | 异步并发执行。`mode` 取 `"coroutine"` 或 `"semaphore"`。 |
+| `get_many_parallel` | `get_many_parallel(urls, method="GET", mode="process", max_workers=None, return_exceptions=True, **kwargs) -> List[Any]` | 对一批 URL 并行请求的便捷方法。 |
+| `get_many_async` | `await get_many_async(urls, method="GET", mode="coroutine", max_concurrency=None, return_exceptions=True, **kwargs) -> List[Any]` | 对一批 URL 异步并发请求的便捷方法。 |
+
+**执行模式：**
+
+| 模式 | 适用方法 | 说明 |
+| --- | --- | --- |
+| `process` | `execute_parallel` | 多进程执行，基于 `ProcessPoolExecutor`，每个子进程独立构造 `HttpClient`。 |
+| `thread` | `execute_parallel` | 多线程执行，请求按索引在多个连接间**负载均衡**（`conn_idx % num_connections`）。 |
+| `coroutine` | `execute_async` | 基于 `asyncio.gather` 的协程并发，同样在连接间负载均衡。 |
+| `semaphore` | `execute_async` | 基于 `asyncio.Semaphore` 的受控并发，可精确限制并发度。 |
+
+示例：
+
+```python
+orch = Orchestrator(num_connections=4, backend="httpx")
+
+# 多进程并行
+results = orch.execute_parallel(items, mode="process")
+
+# 多线程并行
+results = orch.execute_parallel(items, mode="thread")
+
+# 协程并发
+results = await orch.execute_async(items, mode="coroutine")
+
+# 受控并发（最多同时 3 个）
+results = await orch.execute_async(items, mode="semaphore", max_concurrency=3)
+```
+
+### `items` 元素格式
+
+与 `HttpClient.request_many` 一致，支持两种形式：
+
+- **dict**：`{"method": "GET", "url": "https://...", **kwargs}`
+- **tuple/list**：`(method, url)` 或 `(method, url, kwargs_dict)`
+
+### 异常处理
+
+- `return_exceptions=True`（默认）：单个请求失败以**异常对象**形式出现在结果列表中，不影响其余请求。
+- `return_exceptions=False`：任一请求失败即整体抛出。
+- `mode` 取值非法时抛 `ValueError`。
+
+### 独立函数（无需手动构造编排器）
+
+```python
+from snowland_http import execute_parallel_requests, execute_async_requests
+
+# 同步并行执行（内部自动创建并管理编排器）
+results = execute_parallel_requests(
+    items,
+    num_connections=4,
+    backend="httpx",
+    rate_limit=None,
+    mode="process",          # 或 "thread"
+    max_workers=None,
+    return_exceptions=True,
+)
+
+# 异步并发执行
+results = await execute_async_requests(
+    items,
+    num_connections=4,
+    backend="httpx",
+    rate_limit=None,
+    mode="coroutine",        # 或 "semaphore"
+    max_concurrency=None,
+    return_exceptions=True,
+)
+```
+
+> **多进程模式注意事项**：`process` 模式下任务通过 `ProcessPoolExecutor` 派发到子进程，因此传入的 `items` 与返回的 result 必须是**可 pickle 的**；`Task` 的 `pre_process` / `post_process` 也必须是顶层可 pickle 的函数（不能是 lambda 或局部闭包）。
+
+---
+
+## 9. `Task`（任务） *v0.3 新增*
+
+任务封装一次 HTTP 请求，并可选地在请求前后挂载**预处理（pre-process）**与**后处理（post-process）**钩子，用于鉴权注入、参数改写、响应解析、错误封装等场景。
+
+### 构造
+
+```python
+Task(
+    request_params: Dict[str, Any],
+    pre_process: Optional[Callable[[Dict[str, Any]], None]] = None,
+    post_process: Optional[Callable[[HttpResponse], Any]] = None,
+    name: Optional[str] = None,
+)
+```
+
+| 参数 | 说明 |
+| --- | --- |
+| `request_params` | 请求参数字典（如 `{"method": "GET", "url": "https://..."}`）。构造时会做浅拷贝。 |
+| `pre_process` | 可选预处理函数，签名为 `(params: Dict) -> None`。在发送请求前被调用，可**原地修改** `params`。 |
+| `post_process` | 可选后处理函数，签名为 `(response: HttpResponse) -> Any`。在收到响应后被调用，其返回值即任务结果。 |
+| `name` | 可选任务名，用于标识与日志。未传时自动生成为 `task-<id>`。 |
+
+### 方法
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `execute` | `execute(client: HttpClient) -> Any` | 用给定客户端同步执行任务。返回后处理结果；无 `post_process` 时返回原始 `HttpResponse`。 |
+| `execute_async` | `await execute_async(client: HttpClient) -> Any` | 异步执行任务，语义同 `execute`。 |
+| `__repr__` | — | 形如 `Task(name='fetch_data', method='GET', url='https://...')`。 |
+
+### 执行流程
+
+```
+pre_process(request_params)   # 可选：修改请求参数
+        ↓
+client.request(**request_params)   # 发送 HTTP 请求
+        ↓
+post_process(response)        # 可选：转换响应，返回值作为结果
+```
+
+### 示例
+
+```python
+from snowland_http import Task
+
+def add_auth(params):
+    """预处理：注入鉴权头。"""
+    params["headers"] = {"Authorization": "Bearer my_token"}
+
+def extract_json(response):
+    """后处理：直接取出 JSON 数据。"""
+    return response.json()
+
+task = Task(
+    request_params={"method": "GET", "url": "https://api.example.com/data"},
+    pre_process=add_auth,
+    post_process=extract_json,
+    name="fetch_data",
+)
+
+# 用普通客户端单独执行
+result = task.execute(client)          # result 已是 dict（经 extract_json 转换）
+```
+
+### 通过编排器批量执行任务
+
+编排器提供与直接请求对等的任务执行接口：
+
+| 方法 | 签名 | 说明 |
+| --- | --- | --- |
+| `execute_tasks_parallel` | `execute_tasks_parallel(tasks, mode="thread", max_workers=None, return_exceptions=True) -> List[Any]` | 同步并行执行任务。`mode` 取 `"process"` 或 `"thread"` **（默认 `"thread"`）**。 |
+| `execute_tasks_async` | `await execute_tasks_async(tasks, mode="coroutine", max_concurrency=None, return_exceptions=True) -> List[Any]` | 异步并发执行任务。`mode` 取 `"coroutine"` 或 `"semaphore"`。 |
+
+```python
+tasks = [
+    Task(
+        request_params={"method": "GET", "url": f"https://api.example.com/data/{i}"},
+        pre_process=add_auth,
+        post_process=extract_json,
+        name=f"task_{i}",
+    )
+    for i in range(10)
+]
+
+# 并行（thread / process）
+results = orch.execute_tasks_parallel(tasks, mode="thread")
+
+# 并发（coroutine / semaphore）
+results = await orch.execute_tasks_async(tasks, mode="coroutine")
+```
+
+> 结果列表与输入 `tasks` **顺序一一对应**。任务执行中抛出的异常，在 `return_exceptions=True` 时以异常对象形式返回；否则整体抛出。
+
+---
+
+## 10. 版本说明（v0.3）
+
+### 新增
+
+- **编排器 `Orchestrator`**：管理多连接（`HttpClient` 池）的高层 API，支持：
+  - 多进程并行（`ProcessPoolExecutor`）
+  - 多线程并行（连接间负载均衡）
+  - 协程并发（`asyncio.gather` 与 `asyncio.Semaphore` 两种）
+  - 同步 / 异步上下文管理器
+  - 独立函数 `execute_parallel_requests()` / `execute_async_requests()`
+- **任务 `Task`**：带预处理 / 后处理钩子的请求抽象：
+  - `pre_process` 在请求前修改参数（鉴权注入、参数改写等）
+  - `post_process` 在响应后转换数据（解析 JSON、字段提取、错误封装等）
+  - 可单独用 `HttpClient` 执行，也可由 `Orchestrator` 批量执行
+  - `Orchestrator.execute_tasks_parallel()` / `execute_tasks_async()`
+- **示例代码** `examples/orchestrator_example.py`。
+
+### 保持兼容
+
+v0.3 完全向后兼容 v0.2：
+
+- `HttpClient` 全部 API 与语义不变。
+- 零依赖 `stdlib`（urllib）后端不变，`auto` 模式回退行为不变。
+- 响应编码规则（charset 优先、缺省 ISO-8859-1、严格解码）不变。
+- 限流语义（`max_rate <= 0` 禁用限流）不变。
+
+### 使用建议
+
+| 场景 | 建议 |
+| --- | --- |
+| 少量请求、简单调用 | 直接用 `HttpClient.get()` / `get_many()`。 |
+| 大量 I/O 型请求、需要高吞吐 | `Orchestrator` + `mode="coroutine"`（异步后端 httpx/aiohttp）。 |
+| 需要精确控制并发峰值 | `Orchestrator` + `mode="semaphore"` 并设定 `max_concurrency`。 |
+| 请求受 GIL 影响或需进程隔离 | `Orchestrator` + `mode="process"`（注意可 pickle 约束）。 |
+| 需要鉴权注入 / 响应解析 / 重试封装 | 用 `Task` 挂载 `pre_process` / `post_process`。 |
