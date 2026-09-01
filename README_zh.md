@@ -205,6 +205,66 @@ async with Orchestrator(num_connections=4) as orch:
     results = await orch.get_many_async(urls)
 ```
 
+## 任务（Task）预处理和后处理
+
+`Task` 类允许你定义带有可选预处理和后处理钩子的 HTTP 请求：
+
+```python
+from snowland_http import Task
+
+# 定义预处理函数
+def add_auth(params):
+    params["headers"] = {"Authorization": "Bearer token"}
+
+# 定义后处理函数
+def extract_json(response):
+    return response.json()
+
+# 创建任务
+task = Task(
+    request_params={"method": "GET", "url": "https://api.example.com/data"},
+    pre_process=add_auth,
+    post_process=extract_json,
+    name="fetch_data",
+)
+
+# 执行任务
+result = task.execute(client)
+```
+
+**使用 Orchestrator 执行任务：**
+
+```python
+# 创建多个任务
+tasks = [
+    Task(
+        request_params={"method": "GET", "url": f"https://api.example.com/data/{i}"},
+        pre_process=add_auth,
+        post_process=extract_json,
+    )
+    for i in range(10)
+]
+
+# 并行执行任务
+results = orch.execute_tasks_parallel(tasks, mode="thread")
+
+# 并发执行任务
+results = await orch.execute_tasks_async(tasks, mode="coroutine")
+```
+
+**任务执行流程：**
+
+1. **预处理**（可选）：在发送请求前修改请求参数
+2. **HTTP 请求**：执行 HTTP 请求
+3. **后处理**（可选）：在返回前处理响应
+
+这允许你：
+- 动态添加认证头
+- 转换请求参数
+- 提取和转换响应数据
+- 实现自定义错误处理
+- 添加日志或监控
+
 ## 开发与 CI
 
 - 测试在 `master` 与 `dev` 分支上运行（见 `.github/workflows/test.yml`），覆盖 Python 3.8–3.12，安装 `.[all]` 以确保功能/并行测试可执行。

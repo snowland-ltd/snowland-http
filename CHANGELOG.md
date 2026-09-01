@@ -16,7 +16,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Asyncio-based concurrent execution with `asyncio.gather` or `Semaphore`
   - Context manager support for both sync and async workflows
   - Standalone functions `execute_parallel_requests()` and `execute_async_requests()`
-- **Example code**: `examples/orchestrator_example.py` demonstrating Orchestrator usage.
+- **Task class**: a new abstraction for HTTP requests with pre-processing and post-processing hooks.
+  - Supports custom pre-processing functions to modify request parameters before sending
+  - Supports custom post-processing functions to transform responses after receiving
+  - Can be executed directly with `HttpClient` or in batches with `Orchestrator`
+  - Provides `execute_tasks_parallel()` and `execute_tasks_async()` methods in `Orchestrator`
+- **Example code**: `examples/orchestrator_example.py` demonstrating Orchestrator and Task usage.
 
 ## [0.2.0] - 2026-08-09
 

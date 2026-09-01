@@ -203,6 +203,66 @@ async with Orchestrator(num_connections=4) as orch:
     results = await orch.get_many_async(urls)
 ```
 
+### Task (Pre-processing and Post-processing)
+
+The `Task` class allows you to define HTTP requests with optional pre-processing and post-processing hooks:
+
+```python
+from snowland_http import Task
+
+# Define pre-processing function
+def add_auth(params):
+    params["headers"] = {"Authorization": "Bearer token"}
+
+# Define post-processing function
+def extract_json(response):
+    return response.json()
+
+# Create a task
+task = Task(
+    request_params={"method": "GET", "url": "https://api.example.com/data"},
+    pre_process=add_auth,
+    post_process=extract_json,
+    name="fetch_data",
+)
+
+# Execute task
+result = task.execute(client)
+```
+
+**Executing tasks with Orchestrator:**
+
+```python
+# Create multiple tasks
+tasks = [
+    Task(
+        request_params={"method": "GET", "url": f"https://api.example.com/data/{i}"},
+        pre_process=add_auth,
+        post_process=extract_json,
+    )
+    for i in range(10)
+]
+
+# Execute tasks in parallel
+results = orch.execute_tasks_parallel(tasks, mode="thread")
+
+# Execute tasks concurrently
+results = await orch.execute_tasks_async(tasks, mode="coroutine")
+```
+
+**Task execution flow:**
+
+1. **Pre-processing** (optional): Modify request parameters before sending
+2. **HTTP Request**: Execute the HTTP request
+3. **Post-processing** (optional): Process the response before returning
+
+This allows you to:
+- Add authentication headers dynamically
+- Transform request parameters
+- Extract and transform response data
+- Implement custom error handling
+- Add logging or monitoring
+
 ## Development & CI
 
 - Tests run on `master` and `dev` branches (see `.github/workflows/test.yml`), across Python 3.8–3.12, installing `.[all]` so functional/parallel tests execute.
