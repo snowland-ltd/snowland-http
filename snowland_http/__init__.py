@@ -12,6 +12,7 @@ from snowland_http.exceptions import (
 )
 from snowland_http.orchestrator import (
     Orchestrator,
+    Task,
     execute_async_requests,
     execute_parallel_requests,
 )
@@ -27,6 +28,7 @@ __all__ = [
     "BackendNotSupportedError",
     "AsyncRequiredError",
     "Orchestrator",
+    "Task",
     "execute_parallel_requests",
     "execute_async_requests",
 ]
