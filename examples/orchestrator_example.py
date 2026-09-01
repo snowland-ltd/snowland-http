@@ -5,7 +5,7 @@ multiple HTTP connections and execute requests in parallel or concurrently.
 """
 
 import asyncio
-from snowland_http import Orchestrator, RateLimitConfig, execute_parallel_requests, execute_async_requests
+from snowland_http import Orchestrator, RateLimitConfig, Task, execute_parallel_requests, execute_async_requests
 
 
 def example_parallel_thread_mode():
@@ -215,6 +215,181 @@ def example_connection_management():
     print("Closed all connections")
 
 
+def example_task_with_pre_process():
+    """Example: Task with pre-processing."""
+    print("\n=== Task with Pre-processing Example ===")
+
+    def add_auth(params):
+        """Add authentication header to request."""
+        params["headers"] = {"Authorization": "Bearer my_token"}
+
+    with Orchestrator(num_connections=2, backend="stdlib") as orch:
+        # Create tasks with pre-processing
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                pre_process=add_auth,
+                name=f"auth_task_{i}",
+            )
+            for i in range(3)
+        ]
+
+        # Execute tasks in parallel
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Task {i} failed: {result}")
+            else:
+                print(f"Task {i} succeeded: {result.status_code}")
+
+
+def example_task_with_post_process():
+    """Example: Task with post-processing."""
+    print("\n=== Task with Post-processing Example ===")
+
+    def extract_json(response):
+        """Extract JSON data from response."""
+        return response.json()
+
+    with Orchestrator(num_connections=2, backend="stdlib") as orch:
+        # Create tasks with post-processing
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                post_process=extract_json,
+                name=f"extract_task_{i}",
+            )
+            for i in range(3)
+        ]
+
+        # Execute tasks in parallel
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Task {i} failed: {result}")
+            else:
+                print(f"Task {i} succeeded: {type(result).__name__}")
+
+
+def example_task_with_both():
+    """Example: Task with both pre and post processing."""
+    print("\n=== Task with Both Pre and Post-processing Example ===")
+
+    def add_auth(params):
+        """Add authentication header to request."""
+        params["headers"] = {"Authorization": "Bearer my_token"}
+
+    def extract_json(response):
+        """Extract JSON data from response."""
+        return response.json()
+
+    with Orchestrator(num_connections=2, backend="stdlib") as orch:
+        # Create tasks with both pre and post processing
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                pre_process=add_auth,
+                post_process=extract_json,
+                name=f"full_task_{i}",
+            )
+            for i in range(3)
+        ]
+
+        # Execute tasks in parallel
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Task {i} failed: {result}")
+            else:
+                print(f"Task {i} succeeded: {type(result).__name__}")
+
+
+async def example_async_task_execution():
+    """Example: Async task execution."""
+    print("\n=== Async Task Execution Example ===")
+
+    try:
+        def extract_json(response):
+            """Extract JSON data from response."""
+            return response.json()
+
+        async with Orchestrator(num_connections=2, backend="httpx") as orch:
+            # Create tasks with post-processing
+            tasks = [
+                Task(
+                    request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                    post_process=extract_json,
+                    name=f"async_task_{i}",
+                )
+                for i in range(3)
+            ]
+
+            # Execute tasks concurrently
+            results = await orch.execute_tasks_async(tasks, mode="coroutine", return_exceptions=True)
+
+            # Process results
+            for i, result in enumerate(results):
+                if isinstance(result, Exception):
+                    print(f"Task {i} failed: {result}")
+                else:
+                    print(f"Task {i} succeeded: {type(result).__name__}")
+    except Exception as e:
+        print(f"Async example skipped (httpx not available): {e}")
+
+
+def example_task_with_custom_logic():
+    """Example: Task with custom pre/post processing logic."""
+    print("\n=== Task with Custom Logic Example ===")
+
+    def prepare_request(params):
+        """Custom request preparation."""
+        # Add custom headers
+        params["headers"] = {
+            "User-Agent": "MyApp/1.0",
+            "Accept": "application/json",
+        }
+        # Add query parameters
+        params["params"] = {"custom": "value"}
+
+    def process_response(response):
+        """Custom response processing."""
+        data = response.json()
+        # Extract specific fields
+        return {
+            "url": data.get("url"),
+            "headers": data.get("headers", {}),
+            "args": data.get("args", {}),
+        }
+
+    with Orchestrator(num_connections=2, backend="stdlib") as orch:
+        # Create tasks with custom logic
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                pre_process=prepare_request,
+                post_process=process_response,
+                name=f"custom_task_{i}",
+            )
+            for i in range(2)
+        ]
+
+        # Execute tasks in parallel
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
+
+        # Process results
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                print(f"Task {i} failed: {result}")
+            else:
+                print(f"Task {i} succeeded: {result}")
+
+
 if __name__ == "__main__":
     # Run sync examples
     example_parallel_thread_mode()
@@ -222,7 +397,14 @@ if __name__ == "__main__":
     example_custom_requests()
     example_connection_management()
 
+    # Run task examples
+    example_task_with_pre_process()
+    example_task_with_post_process()
+    example_task_with_both()
+    example_task_with_custom_logic()
+
     # Run async examples
     asyncio.run(example_async_coroutine_mode())
     asyncio.run(example_async_semaphore_mode())
     asyncio.run(example_standalone_async())
+    asyncio.run(example_async_task_execution())
