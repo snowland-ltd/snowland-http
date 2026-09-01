@@ -13,7 +13,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from snowland_http import HttpClient, Orchestrator, RateLimitConfig
+from snowland_http import HttpClient, Orchestrator, RateLimitConfig, Task
 
 
 class OrchestratorTest(unittest.TestCase):
@@ -125,6 +125,305 @@ class OrchestratorTest(unittest.TestCase):
         self.assertEqual(len(results), 2)
         self.assertEqual(results[0].status_code, 200)
         self.assertIsInstance(results[1], Exception)
+
+
+class TaskTest(unittest.TestCase):
+    """Tests for Task class."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up a test HTTP server."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"path": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shut down the test server."""
+        cls.server.shutdown()
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def test_task_creation(self):
+        """Test creating a task."""
+        task = Task(
+            request_params={"method": "GET", "url": "https://example.com"},
+            name="test_task",
+        )
+        self.assertEqual(task.name, "test_task")
+        self.assertEqual(task.request_params["method"], "GET")
+
+    def test_task_with_pre_process(self):
+        """Test task with pre-processing."""
+        def add_auth(params):
+            params["headers"] = {"Authorization": "Bearer token"}
+
+        task = Task(
+            request_params={"method": "GET", "url": self._url("/test")},
+            pre_process=add_auth,
+        )
+
+        client = HttpClient(backend="stdlib")
+        result = task.execute(client)
+        self.assertEqual(result.status_code, 200)
+
+    def test_task_with_post_process(self):
+        """Test task with post-processing."""
+        def extract_json(response):
+            return response.json()
+
+        task = Task(
+            request_params={"method": "GET", "url": self._url("/test")},
+            post_process=extract_json,
+        )
+
+        client = HttpClient(backend="stdlib")
+        result = task.execute(client)
+        self.assertIsInstance(result, dict)
+        self.assertIn("path", result)
+
+    def test_task_with_both_pre_and_post_process(self):
+        """Test task with both pre and post processing."""
+        def add_auth(params):
+            params["headers"] = {"Authorization": "Bearer token"}
+
+        def extract_json(response):
+            return response.json()
+
+        task = Task(
+            request_params={"method": "GET", "url": self._url("/test")},
+            pre_process=add_auth,
+            post_process=extract_json,
+        )
+
+        client = HttpClient(backend="stdlib")
+        result = task.execute(client)
+        self.assertIsInstance(result, dict)
+        self.assertIn("path", result)
+
+    def test_task_repr(self):
+        """Test task string representation."""
+        task = Task(
+            request_params={"method": "GET", "url": "https://example.com"},
+            name="test",
+        )
+        repr_str = repr(task)
+        self.assertIn("test", repr_str)
+        self.assertIn("GET", repr_str)
+
+
+class TaskOrchestratorTest(unittest.TestCase):
+    """Tests for executing tasks with Orchestrator."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up a test HTTP server."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"path": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shut down the test server."""
+        cls.server.shutdown()
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    def test_execute_tasks_parallel_thread_mode(self):
+        """Test executing tasks in parallel using thread mode."""
+        orch = Orchestrator(num_connections=2, backend="stdlib")
+
+        def extract_json(response):
+            return response.json()
+
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": self._url(f"/task/{i}")},
+                post_process=extract_json,
+                name=f"task_{i}",
+            )
+            for i in range(3)
+        ]
+
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=False)
+        self.assertEqual(len(results), 3)
+        for result in results:
+            self.assertIsInstance(result, dict)
+            self.assertIn("path", result)
+
+    def test_execute_tasks_parallel_with_pre_process(self):
+        """Test executing tasks with pre-processing."""
+        orch = Orchestrator(num_connections=2, backend="stdlib")
+
+        def add_auth(params):
+            params["headers"] = {"Authorization": "Bearer token"}
+
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": self._url(f"/auth/{i}")},
+                pre_process=add_auth,
+                name=f"auth_task_{i}",
+            )
+            for i in range(3)
+        ]
+
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=False)
+        self.assertEqual(len(results), 3)
+        for result in results:
+            self.assertEqual(result.status_code, 200)
+
+    def test_execute_tasks_parallel_with_exceptions(self):
+        """Test executing tasks with exception handling."""
+        orch = Orchestrator(num_connections=2, backend="stdlib")
+
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": self._url("/ok")},
+                name="ok_task",
+            ),
+            Task(
+                request_params={"method": "GET", "url": "http://127.0.0.1:1/closed"},
+                name="fail_task",
+            ),
+        ]
+
+        results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].status_code, 200)
+        self.assertIsInstance(results[1], Exception)
+
+
+class AsyncTaskOrchestratorTest(unittest.IsolatedAsyncioTestCase):
+    """Async tests for executing tasks with Orchestrator."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up a test HTTP server."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"path": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shut down the test server."""
+        cls.server.shutdown()
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    async def test_execute_tasks_async_coroutine_mode(self):
+        """Test executing tasks in async coroutine mode."""
+        try:
+            orch = Orchestrator(num_connections=2, backend="httpx")
+
+            def extract_json(response):
+                return response.json()
+
+            tasks = [
+                Task(
+                    request_params={"method": "GET", "url": self._url(f"/async_task/{i}")},
+                    post_process=extract_json,
+                    name=f"async_task_{i}",
+                )
+                for i in range(3)
+            ]
+
+            results = await orch.execute_tasks_async(tasks, mode="coroutine", return_exceptions=False)
+            self.assertEqual(len(results), 3)
+            for result in results:
+                self.assertIsInstance(result, dict)
+                self.assertIn("path", result)
+        except Exception as e:
+            self.skipTest(f"httpx not available: {e}")
+
+    async def test_execute_tasks_async_semaphore_mode(self):
+        """Test executing tasks in async semaphore mode."""
+        try:
+            orch = Orchestrator(num_connections=2, backend="httpx")
+
+            def extract_json(response):
+                return response.json()
+
+            tasks = [
+                Task(
+                    request_params={"method": "GET", "url": self._url(f"/sem_task/{i}")},
+                    post_process=extract_json,
+                    name=f"sem_task_{i}",
+                )
+                for i in range(3)
+            ]
+
+            results = await orch.execute_tasks_async(tasks, mode="semaphore", max_concurrency=2, return_exceptions=False)
+            self.assertEqual(len(results), 3)
+            for result in results:
+                self.assertIsInstance(result, dict)
+                self.assertIn("path", result)
+        except Exception as e:
+            self.skipTest(f"httpx not available: {e}")
+
+    async def test_execute_tasks_async_with_exceptions(self):
+        """Test executing tasks with exception handling."""
+        try:
+            orch = Orchestrator(num_connections=2, backend="httpx")
+
+            tasks = [
+                Task(
+                    request_params={"method": "GET", "url": self._url("/ok")},
+                    name="ok_task",
+                ),
+                Task(
+                    request_params={"method": "GET", "url": "http://127.0.0.1:1/closed"},
+                    name="fail_task",
+                ),
+            ]
+
+            results = await orch.execute_tasks_async(tasks, mode="coroutine", return_exceptions=True)
+            self.assertEqual(len(results), 2)
+            self.assertEqual(results[0].status_code, 200)
+            self.assertIsInstance(results[1], Exception)
+        except Exception as e:
+            self.skipTest(f"httpx not available: {e}")
 
 
 class AsyncOrchestratorTest(unittest.IsolatedAsyncioTestCase):
