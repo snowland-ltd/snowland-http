@@ -5,6 +5,19 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-09-01
+
+### Added
+
+- **Orchestrator module**: a new high-level API for managing multiple HTTP connections
+  with parallel/concurrent execution. Supports:
+  - Multi-process parallel execution using `ProcessPoolExecutor`
+  - Multi-threaded execution with load balancing across connections
+  - Asyncio-based concurrent execution with `asyncio.gather` or `Semaphore`
+  - Context manager support for both sync and async workflows
+  - Standalone functions `execute_parallel_requests()` and `execute_async_requests()`
+- **Example code**: `examples/orchestrator_example.py` demonstrating Orchestrator usage.
+
 ## [0.2.0] - 2026-08-09
 
 ### Added
@@ -61,5 +74,6 @@ Initial release of `snowland-http`.
 
 BSD 3-Clause.
 
+[0.3.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.0
 [0.2.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.2.0
 [0.1.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.1.0

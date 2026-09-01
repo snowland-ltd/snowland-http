@@ -13,6 +13,7 @@
 - **可插拔传输层**：`requests`（仅同步）、`httpx`（同步+异步）、`aiohttp`（仅异步），以及 `stdlib`（仅同步，基于 Python 标准库 `urllib`，**无需安装任何第三方库**）。通过 `backend=` 指定，或 `backend="auto"` 自动探测（优先级 httpx > aiohttp > requests > **stdlib**）。
 - **全局限流**：基于令牌桶算法，所有并行 worker 共享同一个限流器，保证聚合请求速率不超过上限；同时提供同步 `acquire()` 与异步 `acquire_async()`。
 - **并行请求**：同步使用线程池（`ThreadPoolExecutor`），异步使用 `asyncio.gather` + `Semaphore` 控制并发度。
+- **编排器（Orchestrator）**：管理多个 HTTP 连接，支持多进程或协程的并行/并发执行，提升吞吐量。
 - **连接生命周期**：显式的 `open()` / `close()`（及其异步版本），并支持上下文管理器——进入时建立连接资源，退出时释放。
 
 ## 安装
@@ -138,6 +139,71 @@ print(resp.status_code, resp.text)
 - `aiohttp` 仅支持异步 API（调用 `request` 会抛 `AsyncRequiredError`）。
 - `httpx` 同时支持同步与异步。
 - `stdlib`（urllib）仅支持同步 API（调用 `request_async` 会抛 `AsyncRequiredError`）。
+
+## 编排器（Orchestrator）多连接并行/并发
+
+`Orchestrator` 类管理一个 `HttpClient` 实例池，提供高层 API 在多个连接上执行请求：
+
+```python
+from snowland_http import Orchestrator, RateLimitConfig
+
+# 创建包含 4 个连接的编排器
+orch = Orchestrator(
+    num_connections=4,
+    backend="httpx",
+    rate_limit=RateLimitConfig(max_rate=10, burst=5),
+)
+
+# 并行执行（多进程或多线程）
+urls = ["https://api.example.com/data/1", "https://api.example.com/data/2"]
+results = orch.execute_parallel(urls, mode="process")  # 或 mode="thread"
+
+# 并发执行（asyncio）
+results = await orch.execute_async(urls, mode="coroutine")  # 或 mode="semaphore"
+```
+
+**执行模式：**
+
+- **并行（同步）**：
+  - `mode="process"`：使用 `ProcessPoolExecutor` 的多进程执行
+  - `mode="thread"`：多线程执行，在多个连接间负载均衡
+- **并发（异步）**：
+  - `mode="coroutine"`：使用 `asyncio.gather` 并在连接间负载均衡
+  - `mode="semaphore"`：使用 `asyncio.Semaphore` 控制并发度
+
+**便捷方法：**
+
+```python
+# 并行 GET 请求
+results = orch.get_many_parallel(urls, mode="thread")
+
+# 异步并发 GET 请求
+results = await orch.get_many_async(urls, mode="coroutine")
+```
+
+**独立函数：**
+
+```python
+from snowland_http import execute_parallel_requests, execute_async_requests
+
+# 并行执行
+results = execute_parallel_requests(items, num_connections=4, mode="process")
+
+# 异步执行
+results = await execute_async_requests(items, num_connections=4, mode="coroutine")
+```
+
+**上下文管理器支持：**
+
+```python
+# 同步上下文管理器
+with Orchestrator(num_connections=4) as orch:
+    results = orch.get_many_parallel(urls)
+
+# 异步上下文管理器
+async with Orchestrator(num_connections=4) as orch:
+    results = await orch.get_many_async(urls)
+```
 
 ## 开发与 CI
 

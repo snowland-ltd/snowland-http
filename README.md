@@ -13,6 +13,7 @@ A rate-limited, parallel HTTP client with pluggable `requests` / `httpx` / `aioh
 - **Pluggable transport**: `requests` (sync only), `httpx` (sync + async), `aiohttp` (async only), and `stdlib` (sync, built on the Python standard library `urllib` — requires **no third-party install**). Select via `backend=` or use `backend="auto"` to auto-detect (preference: httpx > aiohttp > requests > **stdlib**).
 - **Global rate limiting**: a token-bucket limiter shared by all parallel workers, so the aggregate request rate never exceeds the configured ceiling. Provides both a blocking `acquire()` and an async `acquire_async()`.
 - **Parallel requests**: thread pool (`ThreadPoolExecutor`) for sync, and `asyncio.gather` + `Semaphore` for async.
+- **Orchestrator**: manage multiple HTTP connections with multi-process or coroutine-based parallel/concurrent execution for improved throughput.
 - **Connection lifecycle**: explicit `open()` / `close()` (and async counterparts), with context-manager support that opens on enter and closes on exit.
 
 ## Installation
@@ -136,6 +137,71 @@ You can override the resolution by passing `encoding=` when constructing a respo
 - `aiohttp` supports **async** APIs only (calling `request` raises `AsyncRequiredError`).
 - `httpx` supports both.
 - `stdlib` (urllib) supports **sync** APIs only (calling `request_async` raises `AsyncRequiredError`).
+
+### Orchestrator (Multi-connection parallel/concurrent execution)
+
+The `Orchestrator` class manages a pool of `HttpClient` instances and provides high-level APIs for executing requests across multiple connections:
+
+```python
+from snowland_http import Orchestrator, RateLimitConfig
+
+# Create orchestrator with 4 connections
+orch = Orchestrator(
+    num_connections=4,
+    backend="httpx",
+    rate_limit=RateLimitConfig(max_rate=10, burst=5),
+)
+
+# Execute in parallel (multi-process or multi-thread)
+urls = ["https://api.example.com/data/1", "https://api.example.com/data/2"]
+results = orch.execute_parallel(urls, mode="process")  # or mode="thread"
+
+# Execute concurrently (asyncio)
+results = await orch.execute_async(urls, mode="coroutine")  # or mode="semaphore"
+```
+
+**Execution modes:**
+
+- **Parallel (sync)**:
+  - `mode="process"`: Multi-process execution using `ProcessPoolExecutor`
+  - `mode="thread"`: Multi-threaded execution with load balancing across connections
+- **Concurrent (async)**:
+  - `mode="coroutine"`: `asyncio.gather` with load balancing
+  - `mode="semaphore"`: Controlled concurrency using `asyncio.Semaphore`
+
+**Convenience methods:**
+
+```python
+# Parallel GET requests
+results = orch.get_many_parallel(urls, mode="thread")
+
+# Async concurrent GET requests
+results = await orch.get_many_async(urls, mode="coroutine")
+```
+
+**Standalone functions:**
+
+```python
+from snowland_http import execute_parallel_requests, execute_async_requests
+
+# Parallel execution
+results = execute_parallel_requests(items, num_connections=4, mode="process")
+
+# Async execution
+results = await execute_async_requests(items, num_connections=4, mode="coroutine")
+```
+
+**Context manager support:**
+
+```python
+# Sync context manager
+with Orchestrator(num_connections=4) as orch:
+    results = orch.get_many_parallel(urls)
+
+# Async context manager
+async with Orchestrator(num_connections=4) as orch:
+    results = await orch.get_many_async(urls)
+```
 
 ## Development & CI
 
