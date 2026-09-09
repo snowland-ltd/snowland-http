@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Passing a non-default `scheduling` in `mode="process"` is no longer silently
   ignored: a warning is logged explaining why it has no effect there.
 
+### Fixed
+
+- **Thread-safe connection rotation in `Orchestrator.get_connection()`**: the
+  round-robin index (`_current_index`) is now incremented under a lock, preventing
+  lost-update races when `get_connection()` is called concurrently from multiple
+  threads.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added
