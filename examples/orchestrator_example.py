@@ -2,13 +2,57 @@
 
 This example demonstrates how to use the Orchestrator class to manage
 multiple HTTP connections and execute requests in parallel or concurrently.
+
+Like every other example in this folder it talks to the local demo server
+(`_demo_server.py`) through the zero-dependency `stdlib` backend, so it needs
+neither internet access nor a third-party transport.
+
+Run:
+    python examples/orchestrator_example.py
 """
 
 import asyncio
-from snowland_http import Orchestrator, RateLimitConfig, Task, execute_parallel_requests, execute_async_requests
+import importlib.util
+import os
+import sys
+
+_EXAMPLES_DIR = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _EXAMPLES_DIR)  # for `from _demo_server import DemoServer`
+sys.path.insert(0, os.path.dirname(_EXAMPLES_DIR))  # for `import snowland_http` from a checkout
+
+from _demo_server import DemoServer
+
+from snowland_http import (
+    Orchestrator,
+    RateLimitConfig,
+    Task,
+    execute_async_requests,
+    execute_parallel_requests,
+)
+
+TOKEN = "demo-token"
 
 
-def example_parallel_thread_mode():
+def _report(results):
+    """Print one line per result: status code, or the exception type."""
+    for i, result in enumerate(results):
+        if isinstance(result, Exception):
+            print("  %d failed: %s: %s" % (i, type(result).__name__, result))
+        elif hasattr(result, "status_code"):
+            print("  %d succeeded: %s" % (i, result.status_code))
+        else:
+            print("  %d succeeded: %r" % (i, result))
+
+
+def _async_backend():
+    """Return an installed async backend name, or None."""
+    for name in ("httpx", "aiohttp"):
+        if importlib.util.find_spec(name) is not None:
+            return name
+    return None
+
+
+def example_parallel_thread_mode(base):
     """Example: Parallel execution using thread mode."""
     print("=== Parallel Thread Mode Example ===")
 
@@ -19,34 +63,21 @@ def example_parallel_thread_mode():
         rate_limit=RateLimitConfig(max_rate=10, burst=5),
     ) as orch:
         # Define URLs to request
-        urls = [
-            "https://httpbin.org/get/1",
-            "https://httpbin.org/get/2",
-            "https://httpbin.org/get/3",
-            "https://httpbin.org/get/4",
-        ]
+        urls = [base + "/items/%d" % i for i in range(1, 5)]
 
         # Execute in parallel using thread mode
         results = orch.get_many_parallel(urls, mode="thread", return_exceptions=True)
 
-        # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Request {i} failed: {result}")
-            else:
-                print(f"Request {i} succeeded: {result.status_code}")
+        # Process results (same order as the input URLs)
+        _report(results)
 
 
-def example_parallel_process_mode():
+def example_parallel_process_mode(base):
     """Example: Parallel execution using process mode."""
     print("\n=== Parallel Process Mode Example ===")
 
     # Define request items
-    items = [
-        {"method": "GET", "url": "https://httpbin.org/get/1"},
-        {"method": "GET", "url": "https://httpbin.org/get/2"},
-        {"method": "GET", "url": "https://httpbin.org/get/3"},
-    ]
+    items = [{"method": "GET", "url": base + "/items/%d" % i} for i in (1, 2, 3)]
 
     # Execute in parallel using process mode
     results = execute_parallel_requests(
@@ -58,137 +89,93 @@ def example_parallel_process_mode():
     )
 
     # Process results
-    for i, result in enumerate(results):
-        if isinstance(result, Exception):
-            print(f"Request {i} failed: {result}")
-        else:
-            print(f"Request {i} succeeded: {result.status_code}")
+    _report(results)
 
 
-async def example_async_coroutine_mode():
+async def example_async_coroutine_mode(base, backend):
     """Example: Async execution using coroutine mode."""
     print("\n=== Async Coroutine Mode Example ===")
 
-    try:
-        # Create orchestrator with async backend
-        async with Orchestrator(
-            num_connections=4,
-            backend="httpx",
-            rate_limit=RateLimitConfig(max_rate=20, burst=10),
-        ) as orch:
-            # Define URLs to request
-            urls = [
-                "https://httpbin.org/get/1",
-                "https://httpbin.org/get/2",
-                "https://httpbin.org/get/3",
-                "https://httpbin.org/get/4",
-            ]
+    # Create orchestrator with async backend
+    async with Orchestrator(
+        num_connections=4,
+        backend=backend,
+        rate_limit=RateLimitConfig(max_rate=20, burst=10),
+    ) as orch:
+        # Define URLs to request
+        urls = [base + "/items/%d" % i for i in range(1, 5)]
 
-            # Execute concurrently using coroutine mode
-            results = await orch.get_many_async(urls, mode="coroutine", return_exceptions=True)
+        # Execute concurrently using coroutine mode
+        results = await orch.get_many_async(urls, mode="coroutine", return_exceptions=True)
 
-            # Process results
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Request {i} failed: {result}")
-                else:
-                    print(f"Request {i} succeeded: {result.status_code}")
-    except Exception as e:
-        print(f"Async example skipped (httpx not available): {e}")
+        # Process results
+        _report(results)
 
 
-async def example_async_semaphore_mode():
+async def example_async_semaphore_mode(base, backend):
     """Example: Async execution using semaphore mode."""
     print("\n=== Async Semaphore Mode Example ===")
 
-    try:
-        # Create orchestrator with async backend
-        async with Orchestrator(
-            num_connections=2,
-            backend="httpx",
-        ) as orch:
-            # Define URLs to request
-            urls = [
-                "https://httpbin.org/get/1",
-                "https://httpbin.org/get/2",
-                "https://httpbin.org/get/3",
-                "https://httpbin.org/get/4",
-                "https://httpbin.org/get/5",
-            ]
+    # Create orchestrator with async backend
+    async with Orchestrator(
+        num_connections=2,
+        backend=backend,
+    ) as orch:
+        # Define URLs to request
+        urls = [base + "/items/%d" % i for i in range(1, 6)]
 
-            # Execute concurrently with controlled concurrency
-            results = await orch.get_many_async(
-                urls,
-                mode="semaphore",
-                max_concurrency=3,
-                return_exceptions=True,
-            )
-
-            # Process results
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Request {i} failed: {result}")
-                else:
-                    print(f"Request {i} succeeded: {result.status_code}")
-    except Exception as e:
-        print(f"Async example skipped (httpx not available): {e}")
-
-
-async def example_standalone_async():
-    """Example: Standalone async function."""
-    print("\n=== Standalone Async Function Example ===")
-
-    try:
-        # Define request items
-        items = [
-            {"method": "GET", "url": "https://httpbin.org/get/1"},
-            {"method": "GET", "url": "https://httpbin.org/get/2"},
-            {"method": "GET", "url": "https://httpbin.org/get/3"},
-        ]
-
-        # Execute using standalone function
-        results = await execute_async_requests(
-            items,
-            num_connections=2,
-            backend="httpx",
-            mode="coroutine",
+        # Execute concurrently with controlled concurrency
+        results = await orch.get_many_async(
+            urls,
+            mode="semaphore",
+            max_concurrency=3,
             return_exceptions=True,
         )
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Request {i} failed: {result}")
-            else:
-                print(f"Request {i} succeeded: {result.status_code}")
-    except Exception as e:
-        print(f"Async example skipped (httpx not available): {e}")
+        _report(results)
 
 
-def example_custom_requests():
+async def example_standalone_async(base, backend):
+    """Example: Standalone async function."""
+    print("\n=== Standalone Async Function Example ===")
+
+    # Define request items
+    items = [{"method": "GET", "url": base + "/items/%d" % i} for i in (1, 2, 3)]
+
+    # Execute using standalone function
+    results = await execute_async_requests(
+        items,
+        num_connections=2,
+        backend=backend,
+        mode="coroutine",
+        return_exceptions=True,
+    )
+
+    # Process results
+    _report(results)
+
+
+def example_custom_requests(base):
     """Example: Custom request items with different methods and parameters."""
     print("\n=== Custom Requests Example ===")
 
     with Orchestrator(num_connections=2, backend="stdlib") as orch:
-        # Define custom request items
+        # Define custom request items (dicts and tuples are both accepted)
         items = [
-            {"method": "GET", "url": "https://httpbin.org/get", "params": {"key": "value"}},
-            {"method": "POST", "url": "https://httpbin.org/post", "json": {"data": "test"}},
-            ("GET", "https://httpbin.org/get", {"params": {"custom": "param"}}),
+            {"method": "GET", "url": base + "/items/1", "params": {"key": "value"}},
+            {"method": "POST", "url": base + "/echo", "json": {"data": "test"}},
+            ("GET", base + "/items/2", {"headers": {"X-Demo": "tuple-item"}}),
         ]
 
         # Execute in parallel
         results = orch.execute_parallel(items, mode="thread", return_exceptions=True)
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Request {i} failed: {result}")
-            else:
-                print(f"Request {i} succeeded: {result.status_code}")
+        _report(results)
 
 
-def example_connection_management():
+def example_connection_management(base):
     """Example: Manual connection management."""
     print("\n=== Connection Management Example ===")
 
@@ -197,39 +184,39 @@ def example_connection_management():
 
     # Open all connections
     orch.open_all()
-    print(f"Opened {orch.num_connections} connections")
+    print("Opened %d connections" % orch.num_connections)
 
     # Get a specific connection
     conn = orch.get_connection(0)
-    print(f"Got connection 0: {type(conn).__name__}")
+    print("Got connection 0: %s" % type(conn).__name__)
 
     # Use the connection directly
     try:
-        resp = conn.get("https://httpbin.org/get")
-        print(f"Direct request succeeded: {resp.status_code}")
+        resp = conn.get(base + "/items/1")
+        print("Direct request succeeded: %s" % resp.status_code)
     except Exception as e:
-        print(f"Direct request failed: {e}")
+        print("Direct request failed: %s" % e)
 
     # Close all connections
     orch.close_all()
     print("Closed all connections")
 
 
-def example_task_with_pre_process():
+def example_task_with_pre_process(base):
     """Example: Task with pre-processing."""
     print("\n=== Task with Pre-processing Example ===")
 
     def add_auth(params):
         """Add authentication header to request."""
-        params["headers"] = {"Authorization": "Bearer my_token"}
+        params["headers"] = {"Authorization": "Bearer " + TOKEN}
 
     with Orchestrator(num_connections=2, backend="stdlib") as orch:
         # Create tasks with pre-processing
         tasks = [
             Task(
-                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                request_params={"method": "GET", "url": base + "/items/1"},
                 pre_process=add_auth,
-                name=f"auth_task_{i}",
+                name="auth_task_%d" % i,
             )
             for i in range(3)
         ]
@@ -238,14 +225,10 @@ def example_task_with_pre_process():
         results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Task {i} failed: {result}")
-            else:
-                print(f"Task {i} succeeded: {result.status_code}")
+        _report(results)
 
 
-def example_task_with_post_process():
+def example_task_with_post_process(base):
     """Example: Task with post-processing."""
     print("\n=== Task with Post-processing Example ===")
 
@@ -257,9 +240,9 @@ def example_task_with_post_process():
         # Create tasks with post-processing
         tasks = [
             Task(
-                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                request_params={"method": "GET", "url": base + "/items/%d" % (i + 1)},
                 post_process=extract_json,
-                name=f"extract_task_{i}",
+                name="extract_task_%d" % i,
             )
             for i in range(3)
         ]
@@ -268,20 +251,16 @@ def example_task_with_post_process():
         results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Task {i} failed: {result}")
-            else:
-                print(f"Task {i} succeeded: {type(result).__name__}")
+        _report(results)
 
 
-def example_task_with_both():
+def example_task_with_both(base):
     """Example: Task with both pre and post processing."""
     print("\n=== Task with Both Pre and Post-processing Example ===")
 
     def add_auth(params):
         """Add authentication header to request."""
-        params["headers"] = {"Authorization": "Bearer my_token"}
+        params["headers"] = {"Authorization": "Bearer " + TOKEN}
 
     def extract_json(response):
         """Extract JSON data from response."""
@@ -291,10 +270,10 @@ def example_task_with_both():
         # Create tasks with both pre and post processing
         tasks = [
             Task(
-                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                request_params={"method": "GET", "url": base + "/items/%d" % (i + 1)},
                 pre_process=add_auth,
                 post_process=extract_json,
-                name=f"full_task_{i}",
+                name="full_task_%d" % i,
             )
             for i in range(3)
         ]
@@ -303,47 +282,36 @@ def example_task_with_both():
         results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Task {i} failed: {result}")
-            else:
-                print(f"Task {i} succeeded: {type(result).__name__}")
+        _report(results)
 
 
-async def example_async_task_execution():
+async def example_async_task_execution(base, backend):
     """Example: Async task execution."""
     print("\n=== Async Task Execution Example ===")
 
-    try:
-        def extract_json(response):
-            """Extract JSON data from response."""
-            return response.json()
+    def extract_json(response):
+        """Extract JSON data from response."""
+        return response.json()
 
-        async with Orchestrator(num_connections=2, backend="httpx") as orch:
-            # Create tasks with post-processing
-            tasks = [
-                Task(
-                    request_params={"method": "GET", "url": "https://httpbin.org/get"},
-                    post_process=extract_json,
-                    name=f"async_task_{i}",
-                )
-                for i in range(3)
-            ]
+    async with Orchestrator(num_connections=2, backend=backend) as orch:
+        # Create tasks with post-processing
+        tasks = [
+            Task(
+                request_params={"method": "GET", "url": base + "/items/%d" % (i + 1)},
+                post_process=extract_json,
+                name="async_task_%d" % i,
+            )
+            for i in range(3)
+        ]
 
-            # Execute tasks concurrently
-            results = await orch.execute_tasks_async(tasks, mode="coroutine", return_exceptions=True)
+        # Execute tasks concurrently
+        results = await orch.execute_tasks_async(tasks, mode="coroutine", return_exceptions=True)
 
-            # Process results
-            for i, result in enumerate(results):
-                if isinstance(result, Exception):
-                    print(f"Task {i} failed: {result}")
-                else:
-                    print(f"Task {i} succeeded: {type(result).__name__}")
-    except Exception as e:
-        print(f"Async example skipped (httpx not available): {e}")
+        # Process results
+        _report(results)
 
 
-def example_task_with_custom_logic():
+def example_task_with_custom_logic(base):
     """Example: Task with custom pre/post processing logic."""
     print("\n=== Task with Custom Logic Example ===")
 
@@ -362,19 +330,20 @@ def example_task_with_custom_logic():
         data = response.json()
         # Extract specific fields
         return {
-            "url": data.get("url"),
-            "headers": data.get("headers", {}),
-            "args": data.get("args", {}),
+            "method": data.get("method"),
+            "path": data.get("path"),
+            "query": data.get("query", {}),
+            "user_agent": data.get("headers", {}).get("User-Agent"),
         }
 
     with Orchestrator(num_connections=2, backend="stdlib") as orch:
         # Create tasks with custom logic
         tasks = [
             Task(
-                request_params={"method": "GET", "url": "https://httpbin.org/get"},
+                request_params={"method": "GET", "url": base + "/echo"},
                 pre_process=prepare_request,
                 post_process=process_response,
-                name=f"custom_task_{i}",
+                name="custom_task_%d" % i,
             )
             for i in range(2)
         ]
@@ -383,28 +352,38 @@ def example_task_with_custom_logic():
         results = orch.execute_tasks_parallel(tasks, mode="thread", return_exceptions=True)
 
         # Process results
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                print(f"Task {i} failed: {result}")
-            else:
-                print(f"Task {i} succeeded: {result}")
+        _report(results)
+
+
+def main():
+    with DemoServer() as server:
+        base = server.base_url
+        print("demo server: %s" % base)
+
+        # Run sync examples
+        example_parallel_thread_mode(base)
+        example_parallel_process_mode(base)
+        example_custom_requests(base)
+        example_connection_management(base)
+
+        # Run task examples
+        example_task_with_pre_process(base)
+        example_task_with_post_process(base)
+        example_task_with_both(base)
+        example_task_with_custom_logic(base)
+
+        # Run async examples
+        backend = _async_backend()
+        if backend is None:
+            print("\n=== async examples skipped ===")
+            print("no async transport installed; run: pip install httpx")
+            return
+
+        asyncio.run(example_async_coroutine_mode(base, backend))
+        asyncio.run(example_async_semaphore_mode(base, backend))
+        asyncio.run(example_standalone_async(base, backend))
+        asyncio.run(example_async_task_execution(base, backend))
 
 
 if __name__ == "__main__":
-    # Run sync examples
-    example_parallel_thread_mode()
-    example_parallel_process_mode()
-    example_custom_requests()
-    example_connection_management()
-
-    # Run task examples
-    example_task_with_pre_process()
-    example_task_with_post_process()
-    example_task_with_both()
-    example_task_with_custom_logic()
-
-    # Run async examples
-    asyncio.run(example_async_coroutine_mode())
-    asyncio.run(example_async_semaphore_mode())
-    asyncio.run(example_standalone_async())
-    asyncio.run(example_async_task_execution())
+    main()
