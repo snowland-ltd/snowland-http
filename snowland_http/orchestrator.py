@@ -49,6 +49,7 @@ import asyncio
 import logging
 import multiprocessing as mp
 import queue
+import threading
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
@@ -307,6 +308,7 @@ class Orchestrator:
         self._connections: List[HttpClient] = []
         self._init_connections()
         self._current_index = -1
+        self._index_lock = threading.Lock()
 
     def _init_connections(self) -> None:
         """Initialize the pool of HttpClient instances."""
@@ -377,10 +379,11 @@ class Orchestrator:
             if index < 0 or index >= self.num_connections:
                 raise IndexError(f"Connection index {index} out of range [0, {self.num_connections})")
         else:
-            self._current_index += 1
-            if self._current_index >= self.num_connections:
-                self._current_index = 0
-            index = self._current_index
+            with self._index_lock:
+                self._current_index += 1
+                if self._current_index >= self.num_connections:
+                    self._current_index = 0
+                index = self._current_index
         return self._connections[index]
 
     def open_all(self) -> None:
