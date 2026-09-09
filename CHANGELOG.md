@@ -5,6 +5,29 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2026-09-09
+
+### Added
+
+- **Scheduling strategy for `Orchestrator`**: a new `scheduling` argument
+  accepting `"round_robin"` (default, keeps the existing task-index-modulo
+  behaviour) or `"idle"` (each task runs on the next idle connection, and a
+  connection serves a single task at a time). It can be set on
+  `Orchestrator(...)` as the instance default and overridden per call on
+  `execute_parallel` / `execute_tasks_parallel` / `execute_async` /
+  `execute_tasks_async`, as well as `get_many_parallel` / `get_many_async`.
+  New exported constants: `SCHEDULING_ROUND_ROBIN`, `SCHEDULING_IDLE`.
+
+### Changed
+
+- **Process mode reuses `HttpClient`**: `mode="process"` now builds one
+  `HttpClient` per worker process via `ProcessPoolExecutor(initializer=...)`
+  and reuses it, fixing the previous "new client per task" behaviour that
+  prevented connection/session reuse and kept resetting the rate-limiter
+  token bucket.
+- Passing a non-default `scheduling` in `mode="process"` is no longer silently
+  ignored: a warning is logged explaining why it has no effect there.
+
 ## [0.3.0] - 2026-09-01
 
 ### Added
@@ -80,6 +103,7 @@ Initial release of `snowland-http`.
 
 BSD 3-Clause.
 
+[0.3.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.1
 [0.3.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.0
 [0.2.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.2.0
 [0.1.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.1.0

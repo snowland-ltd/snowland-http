@@ -169,6 +169,32 @@ results = await orch.execute_async(urls, mode="coroutine")  # or mode="semaphore
   - `mode="coroutine"`: `asyncio.gather` with load balancing
   - `mode="semaphore"`: Controlled concurrency using `asyncio.Semaphore`
 
+**Scheduling strategies:**
+
+`scheduling` controls how tasks are assigned to the connections in the pool. It can be
+set on the constructor (instance default) and overridden per call.
+
+| Value | Behaviour |
+|-------|-----------|
+| `"round_robin"` (default) | Task `i` always uses connection `i % num_connections`. Fast and deterministic, but a connection can pile up several slow tasks while others sit idle. |
+| `"idle"` | Each task runs on the next idle connection; a connection serves a single task at a time, so concurrency is capped at `num_connections`. Best when request durations vary a lot. |
+
+```python
+from snowland_http import Orchestrator, SCHEDULING_IDLE
+
+orch = Orchestrator(num_connections=4, backend="httpx", scheduling=SCHEDULING_IDLE)
+
+# or per call
+results = orch.execute_parallel(items, mode="thread", scheduling="idle")
+```
+
+Notes:
+
+- In `mode="process"` the parameter is ignored (a warning is logged): worker processes
+  pull tasks from a shared call queue, so idle-first dispatch already happens naturally.
+- With `scheduling="idle"`, use `max_workers >= num_connections` in thread mode so every
+  connection can be busy at the same time.
+
 **Convenience methods:**
 
 ```python

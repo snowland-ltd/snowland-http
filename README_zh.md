@@ -171,6 +171,29 @@ results = await orch.execute_async(urls, mode="coroutine")  # 或 mode="semaphor
   - `mode="coroutine"`：使用 `asyncio.gather` 并在连接间负载均衡
   - `mode="semaphore"`：使用 `asyncio.Semaphore` 控制并发度
 
+**调度策略（scheduling）：**
+
+`scheduling` 决定任务如何分配到连接池中的各个连接，既可以在构造函数上设置（实例默认值），也可以在每次调用时覆盖。
+
+| 取值 | 行为 |
+| --- | --- |
+| `"round_robin"`（默认） | 第 `i` 个任务固定使用第 `i % num_connections` 个连接。确定性强，但当任务耗时长短不一时，慢任务可能全堆在同一个连接上，其他连接空转。 |
+| `"idle"` | 每个任务分配到**当前空闲**的连接，一个连接同一时刻只服务一个任务（并发上限为 `num_connections`）。适合请求耗时差异大的场景。 |
+
+```python
+from snowland_http import Orchestrator, SCHEDULING_IDLE
+
+orch = Orchestrator(num_connections=4, backend="httpx", scheduling=SCHEDULING_IDLE)
+
+# 也可以只在单次调用时指定
+results = orch.execute_parallel(items, mode="thread", scheduling="idle")
+```
+
+注意：
+
+- `mode="process"` 下该参数被忽略（会打印一条 warning 日志）：工作进程本身就从共享任务队列里取活，天然是空闲优先。
+- 使用 `scheduling="idle"` 时，线程模式建议 `max_workers >= num_connections`，否则部分连接永远轮不到。
+
 **便捷方法：**
 
 ```python
