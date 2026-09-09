@@ -11,6 +11,8 @@ from snowland_http.exceptions import (
     HttpClientError,
 )
 from snowland_http.orchestrator import (
+    SCHEDULING_IDLE,
+    SCHEDULING_ROUND_ROBIN,
     Orchestrator,
     Task,
     execute_async_requests,
@@ -31,4 +33,6 @@ __all__ = [
     "Task",
     "execute_parallel_requests",
     "execute_async_requests",
+    "SCHEDULING_ROUND_ROBIN",
+    "SCHEDULING_IDLE",
 ]

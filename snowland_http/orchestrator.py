@@ -8,7 +8,7 @@ Features
 * Multi-process parallel execution for CPU-bound or I/O-bound workloads
 * Asyncio-based concurrent execution for high-throughput I/O operations
 * Connection pooling across multiple HttpClient instances
-* Load balancing across connections
+* Load balancing across connections: round-robin (legacy) or idle-first leasing
 * Unified interface for both sync and async workflows
 * Task-based execution with pre-processing and post-processing hooks
 
@@ -46,13 +46,133 @@ Quick start
 """
 
 import asyncio
+import logging
 import multiprocessing as mp
+import queue
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Union
 
 from snowland_http.client import HttpClient
 from snowland_http.ratelimit import RateLimitConfig
 from snowland_http.response import HttpResponse
+
+logger = logging.getLogger(__name__)
+
+#: Schedule tasks by round-robin over the connection pool (legacy behaviour).
+SCHEDULING_ROUND_ROBIN = "round_robin"
+#: Schedule each task on the next idle connection (exclusive leasing).
+SCHEDULING_IDLE = "idle"
+
+_VALID_SCHEDULING = (SCHEDULING_ROUND_ROBIN, SCHEDULING_IDLE)
+
+
+def _validate_scheduling(value: Optional[str]) -> Optional[str]:
+    """Validate a scheduling strategy value.
+
+    Args:
+        value: Scheduling strategy, or None to inherit the instance default.
+
+    Returns:
+        The validated value (None is passed through unchanged).
+
+    Raises:
+        ValueError: If value is not a known scheduling strategy.
+    """
+    if value is None:
+        return None
+    if value not in _VALID_SCHEDULING:
+        raise ValueError(
+            f"Invalid scheduling: {value!r}. Must be one of {_VALID_SCHEDULING}"
+        )
+    return value
+
+
+class _SyncConnectionLease:
+    """Lease an idle HttpClient from a queue-backed pool (sync / thread mode).
+
+    The pool holds connection indices; taking one reserves the matching
+    connection for the duration of the ``with`` block and returning it marks
+    the connection idle again.
+    """
+
+    def __init__(self, connections: List[HttpClient], pool: "queue.Queue"):
+        self._connections = connections
+        self._pool = pool
+        self._idx: Optional[int] = None
+
+    def __enter__(self) -> HttpClient:
+        self._idx = self._pool.get()
+        return self._connections[self._idx]
+
+    def __exit__(self, *exc) -> bool:
+        if self._idx is not None:
+            self._pool.put(self._idx)
+            self._idx = None
+        return False
+
+
+class _AsyncConnectionLease:
+    """Async counterpart of :class:`_SyncConnectionLease`.
+
+    Used by the coroutine and semaphore modes; waits for an idle connection
+    instead of blocking the event loop.
+    """
+
+    def __init__(self, connections: List[HttpClient], pool: "asyncio.Queue"):
+        self._connections = connections
+        self._pool = pool
+        self._idx: Optional[int] = None
+
+    async def __aenter__(self) -> HttpClient:
+        self._idx = await self._pool.get()
+        return self._connections[self._idx]
+
+    async def __aexit__(self, *exc) -> bool:
+        if self._idx is not None:
+            self._pool.put_nowait(self._idx)
+            self._idx = None
+        return False
+
+
+# ------------------------------------------------------------------ #
+# Process-pool worker state (module level so it can be pickled)
+# ------------------------------------------------------------------ #
+_PROCESS_CLIENT: Optional[HttpClient] = None
+
+
+def _process_worker_initializer(backend: str, rate_config_dict: Optional[Dict[str, Any]]) -> None:
+    """Create one HttpClient per worker process (runs once at process start)."""
+    global _PROCESS_CLIENT
+    _PROCESS_CLIENT = HttpClient(
+        backend=backend,
+        rate_limit=RateLimitConfig(**rate_config_dict) if rate_config_dict else None,
+    )
+
+
+def _process_run_task(task: "Task", return_exceptions: bool) -> Any:
+    """Execute a Task using the process-local HttpClient."""
+    global _PROCESS_CLIENT
+    if _PROCESS_CLIENT is None:  # defensive fallback if the initializer did not run
+        _PROCESS_CLIENT = HttpClient()
+    try:
+        return task.execute(_PROCESS_CLIENT)
+    except Exception as exc:  # noqa: BLE001
+        if return_exceptions:
+            return exc
+        raise
+
+
+def _process_run_item(item: Dict[str, Any], return_exceptions: bool) -> Any:
+    """Execute a raw request item using the process-local HttpClient."""
+    global _PROCESS_CLIENT
+    if _PROCESS_CLIENT is None:  # defensive fallback if the initializer did not run
+        _PROCESS_CLIENT = HttpClient()
+    try:
+        return _PROCESS_CLIENT.request(**item)
+    except Exception as exc:  # noqa: BLE001
+        if return_exceptions:
+            return exc
+        raise
 
 
 class Task:
@@ -157,6 +277,11 @@ class Orchestrator:
         rate_limit: Rate limiting configuration shared across all connections.
         max_workers: Max workers for thread pool (sync mode).
         max_concurrency: Max concurrency for async mode.
+        scheduling: How tasks are distributed over the connection pool:
+            "round_robin" (default, task index modulo num_connections) or
+            "idle" (each task runs on the next idle connection; a connection
+            serves a single task at a time, so concurrency is capped at
+            num_connections). Ignored in "process" mode.
     """
 
     def __init__(
@@ -166,6 +291,7 @@ class Orchestrator:
         rate_limit: Optional[RateLimitConfig] = None,
         max_workers: int = 10,
         max_concurrency: int = 10,
+        scheduling: str = SCHEDULING_ROUND_ROBIN,
     ):
         if num_connections <= 0:
             raise ValueError("num_connections must be positive")
@@ -175,10 +301,12 @@ class Orchestrator:
         self.rate_limit = rate_limit
         self.max_workers = max_workers
         self.max_concurrency = max_concurrency
+        self.scheduling = _validate_scheduling(scheduling)
 
         # Create connection pool
         self._connections: List[HttpClient] = []
         self._init_connections()
+        self._current_index = -1
 
     def _init_connections(self) -> None:
         """Initialize the pool of HttpClient instances."""
@@ -193,9 +321,47 @@ class Orchestrator:
         ]
 
     # ------------------------------------------------------------------ #
+    # Scheduling helpers
+    # ------------------------------------------------------------------ #
+    def _resolve_scheduling(self, scheduling: Optional[str] = None) -> str:
+        """Resolve the effective scheduling strategy for one execution call."""
+        if scheduling is None:
+            return self.scheduling
+        return _validate_scheduling(scheduling)
+
+    def _warn_scheduling_ignored(self, scheduling: str) -> None:
+        """Log a warning when scheduling has no effect (process mode)."""
+        if scheduling != SCHEDULING_ROUND_ROBIN:
+            logger.warning(
+                "scheduling=%r is ignored in 'process' mode: worker processes "
+                "pull tasks from a shared call queue, so idle-first dispatch "
+                "already happens naturally and connections cannot be shared "
+                "across processes.",
+                scheduling,
+            )
+
+    def _new_sync_idle_pool(self) -> "queue.Queue":
+        """Create a sync idle pool pre-filled with every connection index."""
+        pool: "queue.Queue" = queue.Queue(maxsize=self.num_connections)
+        for idx in range(self.num_connections):
+            pool.put(idx)
+        return pool
+
+    def _new_async_idle_pool(self) -> "asyncio.Queue":
+        """Create an async idle pool pre-filled with every connection index.
+
+        Must be built inside the running coroutine: on Python 3.8/3.9 an
+        ``asyncio.Queue`` binds to the current event loop when constructed.
+        """
+        pool: "asyncio.Queue" = asyncio.Queue(maxsize=self.num_connections)
+        for idx in range(self.num_connections):
+            pool.put_nowait(idx)
+        return pool
+
+    # ------------------------------------------------------------------ #
     # Connection management
     # ------------------------------------------------------------------ #
-    def get_connection(self, index: int) -> HttpClient:
+    def get_connection(self, index: int = None) -> HttpClient:
         """Get a specific connection by index.
 
         Args:
@@ -207,8 +373,14 @@ class Orchestrator:
         Raises:
             IndexError: If index is out of range.
         """
-        if index < 0 or index >= self.num_connections:
-            raise IndexError(f"Connection index {index} out of range [0, {self.num_connections})")
+        if index is not None:
+            if index < 0 or index >= self.num_connections:
+                raise IndexError(f"Connection index {index} out of range [0, {self.num_connections})")
+        else:
+            self._current_index += 1
+            if self._current_index >= self.num_connections:
+                self._current_index = 0
+            index = self._current_index
         return self._connections[index]
 
     def open_all(self) -> None:
@@ -252,6 +424,7 @@ class Orchestrator:
         mode: str = "thread",
         max_workers: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute tasks in parallel using multiple processes or threads.
 
@@ -260,6 +433,8 @@ class Orchestrator:
             mode: Execution mode - "process" for multiprocessing, "thread" for threading.
             max_workers: Max number of workers. Defaults to num_connections.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default
+                when given. Ignored (with a warning) in "process" mode.
 
         Returns:
             List of results in the same order as input tasks.
@@ -270,10 +445,13 @@ class Orchestrator:
         if mode not in ("process", "thread"):
             raise ValueError(f"Invalid mode: {mode}. Must be 'process' or 'thread'")
 
+        strategy = self._resolve_scheduling(scheduling)
+
         if mode == "process":
+            self._warn_scheduling_ignored(strategy)
             return self._execute_tasks_multiprocess(tasks, max_workers, return_exceptions)
         else:
-            return self._execute_tasks_multithread(tasks, max_workers, return_exceptions)
+            return self._execute_tasks_multithread(tasks, max_workers, return_exceptions, strategy)
 
     def _execute_tasks_multiprocess(
         self,
@@ -281,7 +459,11 @@ class Orchestrator:
         max_workers: Optional[int],
         return_exceptions: bool,
     ) -> List[Any]:
-        """Execute tasks using multiprocessing."""
+        """Execute tasks using multiprocessing.
+
+        One HttpClient is created per worker process by the pool initializer
+        and reused by every task that process runs.
+        """
         workers = max_workers or self.num_connections
 
         # Prepare data for multiprocessing (must be picklable)
@@ -295,24 +477,15 @@ class Orchestrator:
             else None
         )
 
-        def _worker(task: "Task") -> Any:
-            """Worker function for multiprocessing."""
-            client = HttpClient(
-                backend=backend,
-                rate_limit=RateLimitConfig(**rate_config_dict) if rate_config_dict else None,
-            )
-            try:
-                return task.execute(client)
-            except Exception as exc:  # noqa: BLE001
-                if return_exceptions:
-                    return exc
-                raise
-
         # Execute in parallel
         results: List[Any] = [None] * len(tasks)
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_process_worker_initializer,
+            initargs=(backend, rate_config_dict),
+        ) as executor:
             future_to_index = {
-                executor.submit(_worker, task): idx
+                executor.submit(_process_run_task, task, return_exceptions): idx
                 for idx, task in enumerate(tasks)
             }
             for future in as_completed(future_to_index):
@@ -332,17 +505,23 @@ class Orchestrator:
         tasks: Sequence["Task"],
         max_workers: Optional[int],
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
-        """Execute tasks using threading (load balanced across connections)."""
+        """Execute tasks using threading (distributed across connections)."""
         workers = max_workers or self.num_connections
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_sync_idle_pool() if strategy == SCHEDULING_IDLE else None
 
         # Distribute tasks across connections
         results: List[Any] = [None] * len(tasks)
 
         def _worker(conn_idx: int, task: "Task") -> Any:
             """Worker function for threading."""
-            conn = self._connections[conn_idx % self.num_connections]
             try:
+                if idle_pool is not None:
+                    with _SyncConnectionLease(self._connections, idle_pool) as conn:
+                        return task.execute(conn)
+                conn = self._connections[conn_idx % self.num_connections]
                 return task.execute(conn)
             except Exception as exc:  # noqa: BLE001
                 if return_exceptions:
@@ -374,6 +553,7 @@ class Orchestrator:
         mode: str = "coroutine",
         max_concurrency: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute tasks concurrently using asyncio.
 
@@ -382,6 +562,8 @@ class Orchestrator:
             mode: Execution mode - "coroutine" for asyncio.gather, "semaphore" for controlled concurrency.
             max_concurrency: Max concurrent requests. Defaults to num_connections * max_concurrency.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default
+                when given. With "idle", concurrency is capped at num_connections.
 
         Returns:
             List of results in the same order as input tasks.
@@ -392,21 +574,30 @@ class Orchestrator:
         if mode not in ("coroutine", "semaphore"):
             raise ValueError(f"Invalid mode: {mode}. Must be 'coroutine' or 'semaphore'")
 
+        strategy = self._resolve_scheduling(scheduling)
+
         if mode == "coroutine":
-            return await self._execute_tasks_coroutine(tasks, return_exceptions)
+            return await self._execute_tasks_coroutine(tasks, return_exceptions, strategy)
         else:
             concurrency = max_concurrency or (self.num_connections * self.max_concurrency)
-            return await self._execute_tasks_semaphore(tasks, concurrency, return_exceptions)
+            return await self._execute_tasks_semaphore(tasks, concurrency, return_exceptions, strategy)
 
     async def _execute_tasks_coroutine(
         self,
         tasks: Sequence["Task"],
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
-        """Execute tasks using asyncio.gather with load balancing."""
+        """Execute tasks using asyncio.gather (distributed across connections)."""
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_async_idle_pool() if strategy == SCHEDULING_IDLE else None
+
         async def _run(conn_idx: int, task: "Task") -> Any:
-            conn = self._connections[conn_idx % self.num_connections]
             try:
+                if idle_pool is not None:
+                    async with _AsyncConnectionLease(self._connections, idle_pool) as conn:
+                        return await task.execute_async(conn)
+                conn = self._connections[conn_idx % self.num_connections]
                 return await task.execute_async(conn)
             except Exception as exc:  # noqa: BLE001
                 if return_exceptions:
@@ -421,15 +612,21 @@ class Orchestrator:
         tasks: Sequence["Task"],
         max_concurrency: int,
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute tasks with controlled concurrency using semaphore."""
         sem = asyncio.Semaphore(max_concurrency)
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_async_idle_pool() if strategy == SCHEDULING_IDLE else None
         results: List[Any] = [None] * len(tasks)
 
         async def _run(idx: int, task: "Task") -> Any:
             async with sem:
-                conn = self._connections[idx % self.num_connections]
                 try:
+                    if idle_pool is not None:
+                        async with _AsyncConnectionLease(self._connections, idle_pool) as conn:
+                            return await task.execute_async(conn)
+                    conn = self._connections[idx % self.num_connections]
                     return await task.execute_async(conn)
                 except Exception as exc:  # noqa: BLE001
                     if return_exceptions:
@@ -453,6 +650,7 @@ class Orchestrator:
         mode: str = "process",
         max_workers: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute requests in parallel using multiple processes or threads.
 
@@ -461,6 +659,8 @@ class Orchestrator:
             mode: Execution mode - "process" for multiprocessing, "thread" for threading.
             max_workers: Max number of workers. Defaults to num_connections.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default
+                when given. Ignored (with a warning) in "process" mode.
 
         Returns:
             List of results in the same order as input items.
@@ -471,10 +671,13 @@ class Orchestrator:
         if mode not in ("process", "thread"):
             raise ValueError(f"Invalid mode: {mode}. Must be 'process' or 'thread'")
 
+        strategy = self._resolve_scheduling(scheduling)
+
         if mode == "process":
+            self._warn_scheduling_ignored(strategy)
             return self._execute_multiprocess(items, max_workers, return_exceptions)
         else:
-            return self._execute_multithread(items, max_workers, return_exceptions)
+            return self._execute_multithread(items, max_workers, return_exceptions, strategy)
 
     def _execute_multiprocess(
         self,
@@ -482,7 +685,11 @@ class Orchestrator:
         max_workers: Optional[int],
         return_exceptions: bool,
     ) -> List[Any]:
-        """Execute requests using multiprocessing."""
+        """Execute requests using multiprocessing.
+
+        One HttpClient is created per worker process by the pool initializer
+        and reused by every request that process runs.
+        """
         workers = max_workers or self.num_connections
 
         # Prepare data for multiprocessing (must be picklable)
@@ -496,27 +703,18 @@ class Orchestrator:
             else None
         )
 
-        def _worker(item: Dict[str, Any]) -> Any:
-            """Worker function for multiprocessing."""
-            client = HttpClient(
-                backend=backend,
-                rate_limit=RateLimitConfig(**rate_config_dict) if rate_config_dict else None,
-            )
-            try:
-                return client.request(**item)
-            except Exception as exc:  # noqa: BLE001
-                if return_exceptions:
-                    return exc
-                raise
-
         # Normalize items
         normalized_items = [self._normalize_item(item) for item in items]
 
         # Execute in parallel
         results: List[Any] = [None] * len(normalized_items)
-        with ProcessPoolExecutor(max_workers=workers) as executor:
+        with ProcessPoolExecutor(
+            max_workers=workers,
+            initializer=_process_worker_initializer,
+            initargs=(backend, rate_config_dict),
+        ) as executor:
             future_to_index = {
-                executor.submit(_worker, item): idx
+                executor.submit(_process_run_item, item, return_exceptions): idx
                 for idx, item in enumerate(normalized_items)
             }
             for future in as_completed(future_to_index):
@@ -536,9 +734,12 @@ class Orchestrator:
         items: Sequence[Union[Dict[str, Any], tuple]],
         max_workers: Optional[int],
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
-        """Execute requests using threading (load balanced across connections)."""
+        """Execute requests using threading (distributed across connections)."""
         workers = max_workers or self.num_connections
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_sync_idle_pool() if strategy == SCHEDULING_IDLE else None
         normalized_items = [self._normalize_item(item) for item in items]
 
         # Distribute items across connections
@@ -546,8 +747,11 @@ class Orchestrator:
 
         def _worker(conn_idx: int, item: Dict[str, Any]) -> Any:
             """Worker function for threading."""
-            conn = self._connections[conn_idx % self.num_connections]
             try:
+                if idle_pool is not None:
+                    with _SyncConnectionLease(self._connections, idle_pool) as conn:
+                        return conn.request(**item)
+                conn = self._connections[conn_idx % self.num_connections]
                 return conn.request(**item)
             except Exception as exc:  # noqa: BLE001
                 if return_exceptions:
@@ -582,6 +786,7 @@ class Orchestrator:
         mode: str = "coroutine",
         max_concurrency: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute requests concurrently using asyncio.
 
@@ -590,6 +795,8 @@ class Orchestrator:
             mode: Execution mode - "coroutine" for asyncio.gather, "semaphore" for controlled concurrency.
             max_concurrency: Max concurrent requests. Defaults to num_connections * max_concurrency.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default
+                when given. With "idle", concurrency is capped at num_connections.
 
         Returns:
             List of results in the same order as input items.
@@ -601,23 +808,31 @@ class Orchestrator:
             raise ValueError(f"Invalid mode: {mode}. Must be 'coroutine' or 'semaphore'")
 
         normalized_items = [self._normalize_item(item) for item in items]
+        strategy = self._resolve_scheduling(scheduling)
 
         if mode == "coroutine":
-            return await self._execute_coroutine(normalized_items, return_exceptions)
+            return await self._execute_coroutine(normalized_items, return_exceptions, strategy)
         else:
             concurrency = max_concurrency or (self.num_connections * self.max_concurrency)
-            return await self._execute_semaphore(normalized_items, concurrency, return_exceptions)
+            return await self._execute_semaphore(normalized_items, concurrency, return_exceptions, strategy)
 
     async def _execute_coroutine(
         self,
         items: List[Dict[str, Any]],
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
-        """Execute using asyncio.gather with load balancing."""
+        """Execute using asyncio.gather (distributed across connections)."""
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_async_idle_pool() if strategy == SCHEDULING_IDLE else None
+
         # Distribute items across connections
         async def _run(conn_idx: int, item: Dict[str, Any]) -> Any:
-            conn = self._connections[conn_idx % self.num_connections]
             try:
+                if idle_pool is not None:
+                    async with _AsyncConnectionLease(self._connections, idle_pool) as conn:
+                        return await conn.request_async(**item)
+                conn = self._connections[conn_idx % self.num_connections]
                 return await conn.request_async(**item)
             except Exception as exc:  # noqa: BLE001
                 if return_exceptions:
@@ -632,15 +847,21 @@ class Orchestrator:
         items: List[Dict[str, Any]],
         max_concurrency: int,
         return_exceptions: bool,
+        scheduling: Optional[str] = None,
     ) -> List[Any]:
         """Execute with controlled concurrency using semaphore."""
         sem = asyncio.Semaphore(max_concurrency)
+        strategy = self._resolve_scheduling(scheduling)
+        idle_pool = self._new_async_idle_pool() if strategy == SCHEDULING_IDLE else None
         results: List[Any] = [None] * len(items)
 
         async def _run(idx: int, item: Dict[str, Any]) -> Any:
             async with sem:
-                conn = self._connections[idx % self.num_connections]
                 try:
+                    if idle_pool is not None:
+                        async with _AsyncConnectionLease(self._connections, idle_pool) as conn:
+                            return await conn.request_async(**item)
+                    conn = self._connections[idx % self.num_connections]
                     return await conn.request_async(**item)
                 except Exception as exc:  # noqa: BLE001
                     if return_exceptions:
@@ -665,6 +886,7 @@ class Orchestrator:
         mode: str = "process",
         max_workers: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
         **kwargs,
     ) -> List[Any]:
         """Convenience method for parallel GET requests.
@@ -675,13 +897,20 @@ class Orchestrator:
             mode: Execution mode - "process" or "thread".
             max_workers: Max number of workers.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default.
             **kwargs: Additional request parameters.
 
         Returns:
             List of responses or exceptions.
         """
         items = [{"method": method, "url": url, **kwargs} for url in urls]
-        return self.execute_parallel(items, mode=mode, max_workers=max_workers, return_exceptions=return_exceptions)
+        return self.execute_parallel(
+            items,
+            mode=mode,
+            max_workers=max_workers,
+            return_exceptions=return_exceptions,
+            scheduling=scheduling,
+        )
 
     async def get_many_async(
         self,
@@ -690,6 +919,7 @@ class Orchestrator:
         mode: str = "coroutine",
         max_concurrency: Optional[int] = None,
         return_exceptions: bool = True,
+        scheduling: Optional[str] = None,
         **kwargs,
     ) -> List[Any]:
         """Convenience method for async concurrent GET requests.
@@ -700,13 +930,20 @@ class Orchestrator:
             mode: Execution mode - "coroutine" or "semaphore".
             max_concurrency: Max concurrent requests.
             return_exceptions: If True, return exceptions instead of raising.
+            scheduling: "round_robin" or "idle". Overrides the instance default.
             **kwargs: Additional request parameters.
 
         Returns:
             List of responses or exceptions.
         """
         items = [{"method": method, "url": url, **kwargs} for url in urls]
-        return await self.execute_async(items, mode=mode, max_concurrency=max_concurrency, return_exceptions=return_exceptions)
+        return await self.execute_async(
+            items,
+            mode=mode,
+            max_concurrency=max_concurrency,
+            return_exceptions=return_exceptions,
+            scheduling=scheduling,
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -736,6 +973,7 @@ def execute_parallel_requests(
     mode: str = "process",
     max_workers: Optional[int] = None,
     return_exceptions: bool = True,
+    scheduling: str = SCHEDULING_ROUND_ROBIN,
 ) -> List[Any]:
     """Standalone function for parallel request execution.
 
@@ -747,6 +985,7 @@ def execute_parallel_requests(
         mode: Execution mode - "process" or "thread".
         max_workers: Max number of workers.
         return_exceptions: If True, return exceptions instead of raising.
+        scheduling: "round_robin" or "idle". Ignored in "process" mode.
 
     Returns:
         List of results.
@@ -762,6 +1001,7 @@ def execute_parallel_requests(
         num_connections=num_connections,
         backend=backend,
         rate_limit=rate_limit,
+        scheduling=scheduling,
     ) as orch:
         return orch.execute_parallel(items, mode=mode, max_workers=max_workers, return_exceptions=return_exceptions)
 
@@ -774,6 +1014,7 @@ async def execute_async_requests(
     mode: str = "coroutine",
     max_concurrency: Optional[int] = None,
     return_exceptions: bool = True,
+    scheduling: str = SCHEDULING_ROUND_ROBIN,
 ) -> List[Any]:
     """Standalone async function for concurrent request execution.
 
@@ -785,6 +1026,8 @@ async def execute_async_requests(
         mode: Execution mode - "coroutine" or "semaphore".
         max_concurrency: Max concurrent requests.
         return_exceptions: If True, return exceptions instead of raising.
+        scheduling: "round_robin" or "idle". With "idle", concurrency is
+            capped at num_connections.
 
     Returns:
         List of results.
@@ -801,5 +1044,6 @@ async def execute_async_requests(
         num_connections=num_connections,
         backend=backend,
         rate_limit=rate_limit,
+        scheduling=scheduling,
     ) as orch:
         return await orch.execute_async(items, mode=mode, max_concurrency=max_concurrency, return_exceptions=return_exceptions)

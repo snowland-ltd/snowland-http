@@ -13,7 +13,14 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-from snowland_http import HttpClient, Orchestrator, RateLimitConfig, Task
+from snowland_http import (
+    SCHEDULING_IDLE,
+    SCHEDULING_ROUND_ROBIN,
+    HttpClient,
+    Orchestrator,
+    RateLimitConfig,
+    Task,
+)
 
 
 class OrchestratorTest(unittest.TestCase):
@@ -576,6 +583,279 @@ class StandaloneFunctionsTest(unittest.TestCase):
             asyncio.run(run())
         except Exception as e:
             self.skipTest(f"httpx not available: {e}")
+
+
+class SchedulingTest(unittest.TestCase):
+    """Tests for the Orchestrator scheduling strategies (round-robin vs idle)."""
+
+    @classmethod
+    def setUpClass(cls):
+        """Set up a test HTTP server."""
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = json.dumps({"path": self.path}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        cls.port = cls.server.server_address[1]
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        """Shut down the test server."""
+        cls.server.shutdown()
+
+    def _url(self, path):
+        return f"http://127.0.0.1:{self.port}{path}"
+
+    @staticmethod
+    def _new_state(num_connections):
+        return {
+            "in_flight": [0] * num_connections,
+            "max_in_flight": [0] * num_connections,
+            "counts": [0] * num_connections,
+            "busy": [0.0] * num_connections,
+            "cur": 0,
+            "max_cur": 0,
+        }
+
+    def _install_fake_request(self, orch, durations, state, fail_on=frozenset()):
+        """Patch every connection's request with a recording fake.
+
+        The task index is read from the last URL segment; ``durations`` maps a
+        task index to the number of seconds its request blocks.
+        """
+        lock = threading.Lock()
+
+        def make(idx):
+            def fake(method, url, **kwargs):
+                task_idx = int(url.rsplit("/", 1)[1])
+                with lock:
+                    state["in_flight"][idx] += 1
+                    state["max_in_flight"][idx] = max(
+                        state["max_in_flight"][idx], state["in_flight"][idx]
+                    )
+                    state["cur"] += 1
+                    state["max_cur"] = max(state["max_cur"], state["cur"])
+                    state["counts"][idx] += 1
+                    state["busy"][idx] += durations[task_idx]
+                try:
+                    if task_idx in fail_on:
+                        raise RuntimeError(f"boom-{task_idx}")
+                    time.sleep(durations[task_idx])
+                    return f"ok-{task_idx}"
+                finally:
+                    with lock:
+                        state["in_flight"][idx] -= 1
+                        state["cur"] -= 1
+
+            return fake
+
+        for idx, conn in enumerate(orch._connections):
+            conn.request = make(idx)
+
+    def _items(self, count):
+        return [{"method": "GET", "url": f"http://fake/{i}"} for i in range(count)]
+
+    def test_default_scheduling_is_round_robin(self):
+        """Test that the default scheduling strategy stays round-robin."""
+        orch = Orchestrator(num_connections=2, backend="stdlib")
+        self.assertEqual(orch.scheduling, SCHEDULING_ROUND_ROBIN)
+
+    def test_invalid_scheduling_raises(self):
+        """Test that an unknown scheduling strategy raises ValueError."""
+        with self.assertRaises(ValueError):
+            Orchestrator(num_connections=2, backend="stdlib", scheduling="bogus")
+
+        orch = Orchestrator(num_connections=2, backend="stdlib")
+        with self.assertRaises(ValueError):
+            orch.execute_parallel([], mode="thread", scheduling="bogus")
+
+    def test_round_robin_keeps_index_modulo_mapping(self):
+        """Test that round-robin still maps task i to connection i % N."""
+        orch = Orchestrator(num_connections=3, backend="stdlib", scheduling=SCHEDULING_ROUND_ROBIN)
+        state = self._new_state(3)
+        self._install_fake_request(orch, [0.0] * 7, state)
+
+        orch.execute_parallel(self._items(7), mode="thread", max_workers=1)
+
+        self.assertEqual(state["counts"], [3, 2, 2])
+
+    def test_idle_never_shares_a_connection(self):
+        """Test that idle scheduling keeps at most one request per connection."""
+        orch = Orchestrator(num_connections=3, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(3)
+        self._install_fake_request(orch, [0.02] * 9, state)
+
+        results = orch.execute_parallel(self._items(9), mode="thread", max_workers=9)
+
+        self.assertEqual(sorted(results), sorted(f"ok-{i}" for i in range(9)))
+        for idx in range(3):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
+        self.assertEqual(sum(state["counts"]), 9)
+        self.assertLessEqual(state["max_cur"], 3)
+
+    def test_method_level_scheduling_overrides_instance_default(self):
+        """Test that a per-call scheduling value overrides the instance default."""
+        orch = Orchestrator(num_connections=2, backend="stdlib")  # default round-robin
+        state = self._new_state(2)
+        self._install_fake_request(orch, [0.02] * 4, state)
+
+        orch.execute_parallel(self._items(4), mode="thread", max_workers=4, scheduling=SCHEDULING_IDLE)
+
+        for idx in range(2):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
+
+    def test_idle_balances_unequal_durations(self):
+        """Test that idle scheduling spreads skewed durations over connections."""
+        num_connections = 4
+        durations = [0.30, 0.01, 0.01, 0.01, 0.30, 0.01, 0.01, 0.01]
+
+        rr = Orchestrator(num_connections=num_connections, backend="stdlib", scheduling=SCHEDULING_ROUND_ROBIN)
+        rr_state = self._new_state(num_connections)
+        self._install_fake_request(rr, durations, rr_state)
+        rr.execute_parallel(self._items(len(durations)), mode="thread")
+
+        idle = Orchestrator(num_connections=num_connections, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        idle_state = self._new_state(num_connections)
+        self._install_fake_request(idle, durations, idle_state)
+        idle.execute_parallel(self._items(len(durations)), mode="thread")
+
+        # Round-robin pins both slow tasks on connection 0; idle spreads them.
+        self.assertLess(max(idle_state["busy"]), max(rr_state["busy"]))
+
+    def test_idle_returns_connection_after_exception(self):
+        """Test that a failed task releases its connection again."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(2)
+        self._install_fake_request(orch, [0.01] * 6, state, fail_on=frozenset({0, 1}))
+
+        box = {}
+
+        def run():
+            box["results"] = orch.execute_parallel(
+                self._items(6), mode="thread", return_exceptions=True
+            )
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(10)
+
+        self.assertFalse(thread.is_alive(), "idle pool leaked a connection after an exception")
+        results = box["results"]
+        self.assertEqual(len(results), 6)
+        self.assertEqual(sum(1 for r in results if isinstance(r, Exception)), 2)
+
+    def test_idle_works_with_tasks(self):
+        """Test idle scheduling on the Task-based thread path."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(2)
+        self._install_fake_request(orch, [0.02] * 5, state)
+
+        tasks = [Task(request_params=item, name=f"t{i}") for i, item in enumerate(self._items(5))]
+        results = orch.execute_tasks_parallel(tasks, mode="thread", max_workers=5)
+
+        self.assertEqual(sorted(results), sorted(f"ok-{i}" for i in range(5)))
+        for idx in range(2):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
+
+    def test_process_mode_returns_results_and_warns_on_scheduling(self):
+        """Test that process mode runs and warns that scheduling is ignored."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        items = [{"method": "GET", "url": self._url(f"/proc/{i}")} for i in range(2)]
+
+        with self.assertLogs("snowland_http.orchestrator", level="WARNING") as ctx:
+            results = orch.execute_parallel(items, mode="process", return_exceptions=False)
+
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertEqual(r.status_code, 200)
+        self.assertTrue(any("ignored" in message for message in ctx.output))
+
+
+class SchedulingAsyncTest(unittest.IsolatedAsyncioTestCase):
+    """Async tests for the Orchestrator scheduling strategies."""
+
+    @staticmethod
+    def _new_state(num_connections):
+        return {
+            "in_flight": [0] * num_connections,
+            "max_in_flight": [0] * num_connections,
+            "counts": [0] * num_connections,
+        }
+
+    def _install_fake_request_async(self, orch, state, delay=0.02):
+        """Patch every connection's request_async with a recording fake."""
+        def make(idx):
+            async def fake(method, url, **kwargs):
+                task_idx = int(url.rsplit("/", 1)[1])
+                state["in_flight"][idx] += 1
+                state["max_in_flight"][idx] = max(
+                    state["max_in_flight"][idx], state["in_flight"][idx]
+                )
+                state["counts"][idx] += 1
+                try:
+                    await asyncio.sleep(delay)
+                    return f"ok-{task_idx}"
+                finally:
+                    state["in_flight"][idx] -= 1
+
+            return fake
+
+        for idx, conn in enumerate(orch._connections):
+            conn.request_async = make(idx)
+        return orch
+
+    @staticmethod
+    def _items(count):
+        return [{"method": "GET", "url": f"http://fake/{i}"} for i in range(count)]
+
+    async def test_idle_async_coroutine_mode(self):
+        """Test idle scheduling in async coroutine mode."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(2)
+        self._install_fake_request_async(orch, state)
+
+        results = await orch.execute_async(self._items(6), mode="coroutine")
+
+        self.assertEqual(sorted(results), sorted(f"ok-{i}" for i in range(6)))
+        for idx in range(2):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
+
+    async def test_idle_async_semaphore_mode(self):
+        """Test idle scheduling in async semaphore mode."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(2)
+        self._install_fake_request_async(orch, state)
+
+        results = await orch.execute_async(
+            self._items(6), mode="semaphore", max_concurrency=5
+        )
+
+        self.assertEqual(sorted(results), sorted(f"ok-{i}" for i in range(6)))
+        for idx in range(2):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
+
+    async def test_idle_async_with_tasks(self):
+        """Test idle scheduling on the Task-based async path."""
+        orch = Orchestrator(num_connections=2, backend="stdlib", scheduling=SCHEDULING_IDLE)
+        state = self._new_state(2)
+        self._install_fake_request_async(orch, state)
+
+        tasks = [Task(request_params=item, name=f"t{i}") for i, item in enumerate(self._items(5))]
+        results = await orch.execute_tasks_async(tasks, mode="coroutine")
+
+        self.assertEqual(sorted(results), sorted(f"ok-{i}" for i in range(5)))
+        for idx in range(2):
+            self.assertLessEqual(state["max_in_flight"][idx], 1)
 
 
 if __name__ == "__main__":
