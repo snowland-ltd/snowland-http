@@ -36,3 +36,7 @@ __all__ = [
     "SCHEDULING_ROUND_ROBIN",
     "SCHEDULING_IDLE",
 ]
+
+
+version = (0, 3, 1, "final", 0)
+__version__ = "0.3.1"
