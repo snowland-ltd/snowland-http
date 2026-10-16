@@ -94,14 +94,20 @@ class HttpClient:
     # ------------------------------------------------------------------ #
     # Sync API
     # ------------------------------------------------------------------ #
-    def request(self, method: str, url: str, **kwargs) -> HttpResponse:
+    def request(
+        self,
+        method: str,
+        url: str,
+        rate_limit_cost: float = 1.0,
+        **kwargs,
+    ) -> HttpResponse:
         if self.backend.scheme == "async":
             raise AsyncRequiredError(
                 f"Backend '{self.backend.__class__.__name__}' only supports async; "
                 "use request_async / request_many_async."
             )
         if self.limiter is not None:
-            self.limiter.acquire()
+            self.limiter.acquire(cost=rate_limit_cost)
         return self.backend.request(method, url, **kwargs)
 
     def get(self, url: str, **kwargs) -> HttpResponse:
@@ -159,14 +165,20 @@ class HttpClient:
     # ------------------------------------------------------------------ #
     # Async API
     # ------------------------------------------------------------------ #
-    async def request_async(self, method: str, url: str, **kwargs) -> HttpResponse:
+    async def request_async(
+        self,
+        method: str,
+        url: str,
+        rate_limit_cost: float = 1.0,
+        **kwargs,
+    ) -> HttpResponse:
         if self.backend.scheme == "sync":
             raise AsyncRequiredError(
                 f"Backend '{self.backend.__class__.__name__}' only supports sync; "
                 "use request / request_many."
             )
         if self.limiter is not None:
-            await self.limiter.acquire_async()
+            await self.limiter.acquire_async(cost=rate_limit_cost)
         return await self.backend.request_async(method, url, **kwargs)
 
     async def get_async(self, url: str, **kwargs) -> HttpResponse:

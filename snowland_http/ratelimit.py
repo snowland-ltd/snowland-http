@@ -1,9 +1,19 @@
 """Token-bucket based rate limiter.
 
+Supports three optional limit dimensions, each ANDed together (a call must
+satisfy every enabled bucket):
+
+  * per-second request rate  (``max_rate`` / ``burst``) - requests per second
+  * per-minute request rate  (``rpm``)                - Requests Per Minute
+  * per-minute token rate    (``tpm``)                - Tokens Per Minute (LLM-style)
+
+Pass a per-call ``cost`` to :meth:`RateLimiter.acquire` so each call consumes that
+many units (e.g. the token count of an LLM call) from every enabled bucket.
+
 Provides both a blocking (thread-safe) :meth:`RateLimiter.acquire` and an
-async :meth:`RateLimiter.acquire_async`. The two share the same token counter,
-so the effective rate is honoured whether the client is used from threads or
-from an asyncio event loop.
+async :meth:`RateLimiter.acquire_async`. The two share the same counters, so the
+effective rate is honoured whether the client is used from threads or from an
+asyncio event loop.
 """
 
 import asyncio
@@ -16,89 +26,127 @@ from dataclasses import dataclass
 class RateLimitConfig:
     """Configuration for the rate limiter.
 
-    ``max_rate`` is the maximum number of requests allowed per second.
-    ``burst`` is the maximum number of requests that may be sent back-to-back
-    before the limiter starts throttling. Set ``max_rate <= 0`` to disable
-    rate limiting entirely.
+    ``max_rate`` is the maximum number of requests per second; ``burst`` is the
+    maximum number of requests that may be sent back-to-back before throttling.
+    ``rpm`` is the maximum number of requests per minute (Requests Per Minute).
+    ``tpm`` is the maximum number of tokens per minute (Tokens Per Minute); pass a
+    per-call ``cost`` to :meth:`RateLimiter.acquire` so each call consumes that
+    many tokens.
+
+    Setting every limit to ``<= 0`` disables rate limiting entirely.
     """
 
     max_rate: float = 0.0
     burst: int = 1
+    rpm: float = 0.0
+    tpm: float = 0.0
 
     def enabled(self) -> bool:
-        return self.max_rate > 0
+        return self.max_rate > 0 or self.rpm > 0 or self.tpm > 0
+
+
+class _Bucket:
+    """A single token bucket refilled at ``rate`` units per second.
+
+    When ``per_token`` is False the bucket counts *requests* (every call consumes
+    exactly 1, regardless of ``cost``); when True it counts *tokens* and consumes
+    ``cost`` units per call. This lets a request-rate limit and a TPM limit share
+    one ``acquire(cost=...)`` call with different units.
+    """
+
+    __slots__ = ("capacity", "rate", "tokens", "last", "per_token")
+
+    def __init__(self, capacity: float, rate: float, per_token: bool = False):
+        self.capacity = float(capacity)
+        self.rate = float(rate)
+        self.per_token = per_token
+        self.tokens = float(capacity)
+        self.last = time.monotonic()
+
+    def refill(self, now: float) -> None:
+        elapsed = now - self.last
+        if elapsed > 0:
+            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+            self.last = now
+
+    def deficit(self, cost: float) -> float:
+        """Seconds to wait before the required units are available (0 if ready)."""
+        needed = cost if self.per_token else 1.0
+        if self.tokens >= needed:
+            return 0.0
+        return (needed - self.tokens) / self.rate
+
+    def consume(self, cost: float) -> None:
+        needed = cost if self.per_token else 1.0
+        self.tokens = max(0.0, self.tokens - needed)
 
 
 class RateLimiter:
-    """A thread-safe / asyncio-safe token bucket rate limiter."""
+    """A thread-safe / asyncio-safe token-bucket rate limiter."""
 
     def __init__(self, config: RateLimitConfig):
-        self.enabled = config.max_rate > 0
-        self.rate = float(config.max_rate) if self.enabled else 0.0
-        self.capacity = float(max(int(config.burst), 1)) if self.enabled else 0.0
-        self._tokens = self.capacity
-        self._last = time.monotonic()
+        self.enabled = config.enabled()
+        self._buckets: list = []
+        if config.max_rate > 0:
+            self._buckets.append(
+                _Bucket(capacity=max(float(config.burst), 1.0), rate=float(config.max_rate))
+            )
+        if config.rpm > 0:
+            self._buckets.append(
+                _Bucket(capacity=float(config.rpm), rate=float(config.rpm) / 60.0)
+            )
+        if config.tpm > 0:
+            self._buckets.append(
+                _Bucket(
+                    capacity=float(config.tpm),
+                    rate=float(config.tpm) / 60.0,
+                    per_token=True,
+                )
+            )
         self._lock = threading.Lock()
         self._async_lock = None  # created lazily inside a running loop
 
-    def _refill(self) -> None:
-        if not self.enabled:
-            return
-        now = time.monotonic()
-        elapsed = now - self._last
-        if elapsed > 0:
-            self._tokens = min(self.capacity, self._tokens + elapsed * self.rate)
-            self._last = now
+    def _acquire_common(self, cost: float) -> float:
+        """Refill buckets, return the wait time (seconds) required for ``cost``.
 
-    def acquire(self) -> None:
+        Caller must hold the appropriate lock. Returns 0.0 when no wait is needed.
+        """
+        now = time.monotonic()
+        for b in self._buckets:
+            b.refill(now)
+        wait = max((b.deficit(cost) for b in self._buckets), default=0.0)
+        if wait > 0:
+            time.sleep(wait)
+            now = time.monotonic()
+            for b in self._buckets:
+                b.refill(now)
+        for b in self._buckets:
+            b.consume(cost)
+        return wait
+
+    def acquire(self, cost: float = 1.0) -> None:
         """Blocking acquire.
 
-        When rate limiting is disabled (``max_rate <= 0``) this returns
-        immediately without touching the token bucket or taking the lock, so
-        callers never block and the rate is effectively infinite.
+        Consumes ``cost`` units from every enabled bucket (per-second request
+        rate, RPM, and TPM). ``cost`` defaults to 1, so a plain ``acquire()``
+        keeps the old behaviour; for TPM limiting pass the number of tokens the
+        call spends.
 
-        Otherwise it waits (sleeps) until a token is available. The sleep happens
-        *inside* the lock so that ``_last`` (and therefore the token refill
-        baseline) is advanced serially and stays visible to every other waiting
-        thread. Letting the sleep happen outside the lock would let concurrent
-        threads each push ``_last`` forward independently, which under-counts the
-        total wait time of a parallel burst.
+        When rate limiting is disabled this returns immediately.
         """
-        if not self.enabled:
+        if not self.enabled or not self._buckets:
             return
         with self._lock:
-            self._refill()
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            wait = (1.0 - self._tokens) / self.rate
-            self._tokens = 0.0
-            # Advance the reference time to when the token actually arrives,
-            # otherwise the sleeping time would be counted as refill too.
-            self._last += wait
-            time.sleep(wait)
+            self._acquire_common(cost)
 
-    async def acquire_async(self) -> None:
-        """Async acquire.
-
-        When rate limiting is disabled (``max_rate <= 0``) this returns
-        immediately. Otherwise it awaits (via asyncio.sleep) until a token is
-        available.
-
-        The sleep happens *inside* the lock (asyncio keeps the lock held across
-        the await) so that ``_last`` advances serially and stays visible to every
-        other coroutine, preserving the global rate for concurrent requests.
-        """
-        if not self.enabled:
+    async def acquire_async(self, cost: float = 1.0) -> None:
+        """Async acquire. See :meth:`acquire`."""
+        if not self.enabled or not self._buckets:
             return
         if self._async_lock is None:
             self._async_lock = asyncio.Lock()
         async with self._async_lock:
-            self._refill()
-            if self._tokens >= 1.0:
-                self._tokens -= 1.0
-                return
-            wait = (1.0 - self._tokens) / self.rate
-            self._tokens = 0.0
-            self._last += wait
-            await asyncio.sleep(wait)
+            # Run the (blocking) token math in a worker thread so the event loop
+            # is never stalled by the sleep inside _acquire_common.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._acquire_common, cost)
