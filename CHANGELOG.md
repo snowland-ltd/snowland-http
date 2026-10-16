@@ -5,6 +5,21 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-10-16
+
+### Added
+
+- **RPM / TPM rate-limit modes**: `RateLimitConfig` gains `rpm` (requests per
+  minute) and `tpm` (tokens per minute) fields, alongside the existing
+  `max_rate` / `burst`. All configured limits are combined with a logical AND —
+  every call must satisfy every enabled limit. Request-based limits
+  (`max_rate`, `rpm`) count exactly one request per call; the token-based limit
+  (`tpm`) consumes `cost` tokens per call, where `cost` is supplied via the new
+  `rate_limit_cost` argument on `HttpClient.request` / `request_async` / `get` /
+  `get_many` / `post` / `post_many` (and as `cost` to `RateLimiter.acquire`).
+  `RateLimiter` now holds one token bucket per enabled limit and blocks until the
+  tightest one admits the call.
+
 ## [0.3.1] - 2026-09-09
 
 ### Added
@@ -110,7 +125,8 @@ Initial release of `snowland-http`.
 
 BSD 3-Clause.
 
-[0.3.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.1
+[0.3.2]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.2
+[0.3.1]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.1
 [0.3.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.3.0
 [0.2.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.2.0
 [0.1.0]: https://github.com/snowland-ltd/snowland-http/releases/tag/v0.1.0
